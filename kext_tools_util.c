@@ -24,23 +24,16 @@
 #include <TargetConditionals.h>
 #if !TARGET_OS_EMBEDDED
     #include <bless.h>
-    #include <libgen.h>
     #include "bootcaches.h"
 #endif  // !TARGET_OS_EMBEDDED
 
 #include <libc.h>
-#include <stdint.h>
 #include <sysexits.h>
 #include <asl.h>
 #include <syslog.h>
 #include <sys/resource.h>
 #include <IOKit/kext/OSKext.h>
 #include <IOKit/kext/OSKextPrivate.h>
-#include <sandbox/rootless.h>
-#include <os/log_private.h>
-
-#include <sys/types.h>
-#include <sys/sysctl.h>
 
 #include "kext_tools_util.h"
 
@@ -210,7 +203,7 @@ ExitStatus writeToFile(
         if (bytesWritten < 0) {
             OSKextLog(/* kext */ NULL,
                       kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                      "Write failed %d - %s", errno, strerror(errno));
+                      "Write failed - %s", strerror(errno));
             goto finish;
         }
         totalBytesWritten += bytesWritten;
@@ -263,7 +256,7 @@ void postNoteAboutKextLoadsMT(CFStringRef theNotificationCenterName,
     
     if (theKextPathArray == NULL || theNotificationCenterName == NULL)
         return;
- 
+    
     myCenter = CFNotificationCenterGetDistributedCenter();
     myInfoDict = CFDictionaryCreateMutable(
                                            kCFAllocatorDefault, 0,
@@ -285,7 +278,7 @@ void postNoteAboutKextLoadsMT(CFStringRef theNotificationCenterName,
     }
     
     SAFE_RELEASE(myInfoDict);
-   
+    
     return;
 }
 
@@ -301,7 +294,6 @@ void addKextToAlertDict( CFMutableDictionaryRef *theDictPtr, OSKextRef theKext )
     CFMutableDictionaryRef  myKextInfoDict = NULL;  // must release
     CFMutableDictionaryRef  myAlertInfoDict = NULL; // do NOT release
     CFIndex                myCount, i;
-  
     
     if ( theDictPtr == NULL || theKext == NULL ) {
         return;
@@ -454,70 +446,6 @@ Boolean isDebugSetInBootargs(void)
 }
 
 #endif  // !TARGET_OS_EMBEDDED
-
-/*******************************************************************************
- * createRawBytesFromHexString() - Given an ASCII hex string + length, dump the
- * computer-readable equivalent into a byte pointer. **Only accepts hex strings
- * of even length, because I'm lazy.**
- *******************************************************************************/
-Boolean createRawBytesFromHexString(char *bytePtr, size_t byteLen, const char *hexPtr, size_t hexLen)
-{
-    size_t minByteLen = (hexLen + 1)/2;
-
-    if (!bytePtr || !hexPtr) {
-        return false;
-    } else if (hexLen % 2 != 0) {
-        return false;
-    } else if (minByteLen > byteLen) {
-        return false;
-    }
-
-    /* reset the output to 0 */
-    memset(bytePtr, 0, minByteLen);
-
-    for (size_t index = 0; index < hexLen; index++) {
-        uint8_t nibble;
-        uint8_t shift = (((index + 1) % 2) ? 4 : 0);
-        char    hex   = hexPtr[index];
-
-        if ('0' <= hex && hex <= '9') {
-            nibble = hex - '0';
-        } else if ('A' <= hex && hex <= 'F') {
-            nibble = 10 + (hex - 'A');
-        } else if ('a' <= hex && hex <= 'f') {
-            nibble = 10 + (hex - 'a');
-        } else {
-            return false;
-        }
-        bytePtr[index/2] += (nibble << shift);
-    }
-    return true;
-}
-
-/*******************************************************************************
- * createHexStringFromRawBytes() - Given a byte pointer + length, dump the
- * human-readable equivalent into a hex string pointer.
- *******************************************************************************/
-Boolean createHexStringFromRawBytes(char *hexPtr, size_t hexLen, const char *bytePtr, size_t byteLen)
-{
-    size_t minHexLen = (byteLen * 2) + 1;
-    const char *hexes = "0123456789abcdef";
-
-    if (!hexPtr || !bytePtr) {
-        return false;
-    } else if (minHexLen > hexLen) {
-        return false;
-    }
-
-    for (size_t bidx = 0, hidx = 0; bidx < byteLen; bidx++) {
-        const uint8_t byte = (const uint8_t)bytePtr[bidx];
-        hexPtr[hidx++] = hexes[byte >> 4];
-        hexPtr[hidx++] = hexes[byte & 0x0f];
-    }
-    /* NULL-terminate */
-    hexPtr[minHexLen-1] = 0;
-    return true;
-}
 
 #if PRAGMA_MARK
 #pragma mark Path & File
@@ -911,29 +839,6 @@ finish:
 /*******************************************************************************
  *******************************************************************************/
 ExitStatus
-getFileDescriptorTimes(
-                 int                the_fd,
-                 struct timeval     cacheFileTimes[2])
-{
-    struct stat         statBuffer;
-    ExitStatus          result          = EX_SOFTWARE;
-    
-    result = fstat(the_fd, &statBuffer);
-    if (result != EX_OK) {
-        goto finish;
-    }
-    
-    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[0], &statBuffer.st_atimespec);
-    TIMESPEC_TO_TIMEVAL(&cacheFileTimes[1], &statBuffer.st_mtimespec);
-    
-    result = EX_OK;
-finish:
-    return result;
-}
-
-/*******************************************************************************
- *******************************************************************************/
-ExitStatus
 getFilePathTimes(
                  const char        * filePath,
                  struct timeval      cacheFileTimes[2])
@@ -1059,122 +964,6 @@ finish:
     SAFE_RELEASE(tmpCFString);
     
     return suffixPtr;
-}
-
-/*******************************************************************************
- *******************************************************************************/
-int getFileDevAndInoWith_fd(int the_fd, dev_t * the_dev_t, ino_t * the_ino_t)
-{
-    int             my_result = -1;
-    struct stat     my_stat_buf;
-   
-    if (fstat(the_fd, &my_stat_buf) == 0) {
-        if (the_dev_t) {
-            *the_dev_t = my_stat_buf.st_dev;
-        }
-        if (the_ino_t) {
-            *the_ino_t = my_stat_buf.st_ino;
-        }
-        my_result = 0;
-    }
-    else {
-        my_result = errno;
-    }
-    
-    return(my_result);
-}
-
-/*******************************************************************************
- *******************************************************************************/
-int getFileDevAndIno(const char * thePath, dev_t * the_dev_t, ino_t * the_ino_t)
-{
-    int             my_result = -1;
-    struct stat     my_stat_buf;
-    
-    if (stat(thePath, &my_stat_buf) == 0) {
-        if (the_dev_t) {
-            *the_dev_t = my_stat_buf.st_dev;
-        }
-        if (the_ino_t) {
-            *the_ino_t = my_stat_buf.st_ino;
-        }
-        my_result = 0;
-    }
-    else {
-        my_result = errno;
-    }
-    
-    return(my_result);
-}
-
-/*******************************************************************************
- * If the_dev_t and the_ino_t are 0 then we expect thePath to NOT exist.
- *******************************************************************************/
-Boolean isSameFileDevAndIno(int the_fd,
-                            const char * thePath,
-                            bool followSymlinks,
-                            dev_t the_dev_t,
-                            ino_t the_ino_t)
-{
-    Boolean         my_result = FALSE;
-    struct stat     my_stat_buf;
-
-    if (the_fd == -1) {
-        int ret;
-        if (followSymlinks) {
-            ret = stat(thePath, &my_stat_buf);
-        } else {
-            ret = lstat(thePath, &my_stat_buf);
-        }
-        /* means we are passed a full path in thePath */
-        if (ret == 0) {
-            if (the_dev_t == my_stat_buf.st_dev &&
-                the_ino_t == my_stat_buf.st_ino) {
-                my_result = TRUE;
-            }
-        } else if (errno == ENOENT && the_dev_t == 0 && the_ino_t == 0) {
-            /* special case where thePath did not exist so it still should not
-             * exist
-             */
-            my_result = TRUE;
-        }
-    } else {
-        /* means we are passed a relative path from the_fd */
-        int flags = followSymlinks ? 0 : AT_SYMLINK_NOFOLLOW;
-        if (fstatat(the_fd, thePath, &my_stat_buf, flags) == 0) {
-            if (the_dev_t == my_stat_buf.st_dev &&
-                the_ino_t == my_stat_buf.st_ino) {
-                my_result = TRUE;
-            }
-        } else if (errno == ENOENT && the_dev_t == 0 && the_ino_t == 0) {
-            /* special case where thePath did not exist so it still should not
-             * exist
-             */
-            my_result = TRUE;
-        }
-    }
-    
-    return(my_result);
-}
-
-
-/*******************************************************************************
- *******************************************************************************/
-Boolean isSameFileDevAndInoWith_fd(int      the_fd,
-                                   dev_t    the_dev_t,
-                                   ino_t    the_ino_t)
-{
-    Boolean         my_result = FALSE;
-    struct stat     my_stat_buf;
-    
-    if (fstat(the_fd, &my_stat_buf) == 0) {
-        if (the_dev_t == my_stat_buf.st_dev &&
-            the_ino_t == my_stat_buf.st_ino) {
-            my_result = TRUE;
-        }
-    }
-    
-    return(my_result);
 }
 
 #if PRAGMA_MARK
@@ -1315,59 +1104,20 @@ void beQuiet(void)
     return;
 }
 
-bool
-get_kextlog(uint32_t *mode)
-{
-    char bootargs[1024];
-    size_t size = sizeof(bootargs);
-    char *kextlog;
-
-    if (sysctlbyname("kern.bootargs", bootargs, &size, NULL, 0) == 0 && (kextlog = strcasestr(bootargs, "kextlog=")) != NULL) {
-        char *token = NULL;
-        uint32_t value = (uint32_t)strtoul(&kextlog[strlen("kextlog=")], &token, 16);
-        if (token == NULL || (*token) == '\0' || isspace(*token)) {
-            *mode = value;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-
 /*******************************************************************************
 *******************************************************************************/
 FILE * g_log_stream = NULL;
-static boolean_t sNewLoggingOnly  = false;
-static os_log_t  sKextLog         = NULL;
-static os_log_t  sKextSignpostLog = NULL;
+aslclient gASLClientHandle = NULL;
+aslmsg    gASLMessage      = NULL;  // reused
 // xxx - need to aslclose()
 
-void tool_initlog()
+void tool_openlog(const char * name)
 {
-    uint32_t kextlog_mode = 0;
-    if (get_kextlog(&kextlog_mode)) {
-        os_log(OS_LOG_DEFAULT, "Setting kext log mode: 0x%x", kextlog_mode);
-        OSKextSetLogFilter(kextlog_mode, /* kernel? */ false);
-        OSKextSetLogFilter(kextlog_mode, /* kernel? */ true);
-    }
-
-    if (sKextLog == NULL) {
-        sKextLog = os_log_create("com.apple.kext", "kextlog");
-        sKextSignpostLog = os_log_create("com.apple.kext", "signposts");
-    }
-}
-
-void tool_openlog(const char * __unused name)
-{
-    sNewLoggingOnly = true;
-    tool_initlog();
-}
-
-os_log_t
-get_signpost_log(void)
-{
-    return sKextSignpostLog;
+    // xxx - do we want separate name & facility?
+    gASLClientHandle = asl_open(/* ident */ name, /* facility*/ name,
+        /* options */ 0);
+    gASLMessage     = asl_new(ASL_TYPE_MSG);
+    return;
 }
 
 #if !TARGET_OS_EMBEDDED
@@ -1392,7 +1142,7 @@ Boolean useDevelopmentKernel(const char * theKernelPath)
         length = strlcpy(tempPath, theKernelPath, PATH_MAX);
         if (length >= PATH_MAX)   break;
         length = strlcat(tempPath,
-                         kDefaultDevKernelSuffix,
+                         kDefaultKernelSuffix,
                          PATH_MAX);
         if (length >= PATH_MAX)   break;
         if (statPath(tempPath, &statBuf) == EX_OK) {
@@ -1418,27 +1168,33 @@ void tool_log(
     OSKextLogSpec   msgLogSpec,
     const char    * format, ...)
 {
-    OSKextLogSpec kextLogLevel = msgLogSpec & kOSKextLogLevelMask;
-    os_log_type_t logType = OS_LOG_TYPE_DEFAULT;
     va_list ap;
 
-    if (kextLogLevel == kOSKextLogErrorLevel) {
-        logType = OS_LOG_TYPE_ERROR;
-    } else if (kextLogLevel == kOSKextLogWarningLevel) {
-        logType = OS_LOG_TYPE_DEFAULT;
-    } else if (kextLogLevel == kOSKextLogBasicLevel) {
-        logType = OS_LOG_TYPE_DEFAULT;
-    } else if (kextLogLevel < kOSKextLogDebugLevel) {
-        logType = OS_LOG_TYPE_INFO;
+    if (gASLClientHandle) {
+        int            aslLevel = ASL_LEVEL_ERR;
+        OSKextLogSpec  kextLogLevel = msgLogSpec & kOSKextLogLevelMask;
+        char           messageLogSpec[16];
+
+        if (kextLogLevel == kOSKextLogErrorLevel) {
+            aslLevel = ASL_LEVEL_ERR;
+        } else if (kextLogLevel == kOSKextLogWarningLevel) {
+            aslLevel = ASL_LEVEL_WARNING;
+        } else if (kextLogLevel == kOSKextLogBasicLevel) {
+            aslLevel = ASL_LEVEL_NOTICE;
+        } else if (kextLogLevel < kOSKextLogDebugLevel) {
+            aslLevel = ASL_LEVEL_INFO;
+        } else {
+            aslLevel = ASL_LEVEL_DEBUG;
+        }
+        
+        snprintf(messageLogSpec, sizeof(messageLogSpec), "0x%x", msgLogSpec);
+        asl_set(gASLMessage, "OSKextLogSpec", messageLogSpec);
+
+        va_start(ap, format);
+        asl_vlog(gASLClientHandle, gASLMessage, aslLevel, format, ap);
+        va_end(ap);
+
     } else {
-        logType = OS_LOG_TYPE_DEBUG;
-    }
-
-    va_start(ap, format);
-    os_log_with_args(sKextLog, logType, format, ap, __builtin_return_address(0));
-    va_end(ap);
-
-    if (!sNewLoggingOnly) {
         // xxx - change to pick log stream based on log level
         // xxx - (0 == stdout, all others stderr)
 
@@ -1523,7 +1279,6 @@ BRBLLogFunc(void *refcon __unused, int32_t level, const char *string)
  *
  * theVolRootURL == NULL means we want root volume.
  *******************************************************************************/
-// FIXME: doesn't work on non-/ volumes due to SIP check in copyBootCachesDictForURL()
 Boolean getKernelPathForURL(CFURLRef    theVolRootURL,
                             char *      theBuffer,
                             int         theBufferSize)
@@ -1531,7 +1286,7 @@ Boolean getKernelPathForURL(CFURLRef    theVolRootURL,
     CFDictionaryRef myDict              = NULL;     // must release
     CFDictionaryRef postBootPathsDict   = NULL;     // do not release
     CFDictionaryRef kernelCacheDict     = NULL;     // do not release
-    Boolean         myResult            = FALSE;
+    Boolean			myResult            = FALSE;
    
     if (theBuffer) {
         *theBuffer = 0x00;
@@ -1545,11 +1300,7 @@ Boolean getKernelPathForURL(CFURLRef    theVolRootURL,
                 CFGetTypeID(postBootPathsDict) == CFDictionaryGetTypeID()) {
                 
                 kernelCacheDict = (CFDictionaryRef)
-                    CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV4Key);
-                if (!kernelCacheDict) {
-                    kernelCacheDict = (CFDictionaryRef)
-                        CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
-                }
+                    CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
             }
         }
     } // theBuffer
@@ -1593,7 +1344,6 @@ CFDictionaryRef copyBootCachesDictForURL(CFURLRef theVolRootURL)
     CFStringRef             myPath = NULL;              // must release
     CFURLRef                myURL = NULL;               // must release
     CFDictionaryRef         myBootCachesPlist = NULL;   // do not release
-    char *                  myCString = NULL;           // must free
     
     if (theVolRootURL) {
         myVolRoot = CFURLCopyFileSystemPath(theVolRootURL,
@@ -1615,18 +1365,6 @@ CFDictionaryRef copyBootCachesDictForURL(CFURLRef theVolRootURL)
                                            kCFStringEncodingUTF8 );
     }
     if (myPath == NULL) {
-        goto finish;
-    }
-    
-    myCString = createUTF8CStringForCFString(myPath);
-    if (myCString == NULL) {
-        goto finish;
-    }
-    if (rootless_check_trusted(myCString) != 0) {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel  | kOSKextLogGeneralFlag,
-                  "Untrusted file '%s' cannot be used",
-                  myCString);
         goto finish;
     }
     
@@ -1670,58 +1408,8 @@ finish:
     SAFE_RELEASE(myURL);
     SAFE_RELEASE(myPath);
     SAFE_RELEASE(myVolRoot);
-    SAFE_FREE(myCString);
-
+    
     return(myBootCachesPlist);
-}
-
-bool
-translatePrelinkedToImmutablePath(const char *prelinked_path, char *imk_path, size_t imk_len)
-{
-    char plk_name[PATH_MAX] = {};
-    char plk_path[PATH_MAX] = {};
-
-    if (!prelinked_path || !imk_path || imk_len < strlen(_kOSKextPrelinkedKernelFileName))
-        return false;
-
-    if (!basename_r(prelinked_path, plk_name))
-        return false;
-    if (!dirname_r(prelinked_path, plk_path))
-        return false;
-    /*
-     * If dirname_r() doesn't find any path component in 'prelinked_path'
-     * either because the path is NULL, or because it's a simple filename,
-     * then it will copy "." into plk_path. We want to translate a simple
-     * filename, e.g. "prelinkedkernel.kasan", into "immutablekernel.kasan",
-     * so we look for a return value of "." and simply clear the path
-     * component of the name.
-     */
-    if (strncmp(plk_path, ".", 2) == 0)
-        plk_path[0] = 0;
-
-    // validate the prelinkedkernel name
-    size_t plk_nm_len = strnlen(plk_name, sizeof(plk_name));
-    size_t plk_pfx_len = strlen(_kOSKextPrelinkedKernelFileName);
-    if (plk_nm_len < plk_pfx_len ||
-        strncmp(plk_name, _kOSKextPrelinkedKernelFileName, plk_pfx_len) != 0) {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
-                  "Cannot build immutable kernel using \"%s\": the filename must begin with \"%s\"",
-                  prelinked_path, _kOSKextPrelinkedKernelFileName);
-        return false;
-    }
-
-    // build the immutable kernel file name
-    // note 'plk_path' contains the directory name from dirname_r above
-    // (or NULL for filename only conversion)
-    const char *plk_suffix = (const char *)((uintptr_t)plk_name + plk_pfx_len);
-    if (strlcpy(imk_path, plk_path, imk_len) > imk_len ||
-        strlcat(imk_path, kImmutableKernelFileName, imk_len) > imk_len ||
-        strlcat(imk_path, plk_suffix, imk_len) > imk_len) {
-        return false;
-    }
-
-    return true;
 }
 #endif   // !TARGET_OS_EMBEDDED
 
@@ -2031,33 +1719,3 @@ finish:
     return result;
 }
 
-void
-setVariantSuffix(void)
-{
-    char* variant = 0;
-    size_t len = 0;
-    int result;
-    result = sysctlbyname("kern.osbuildconfig", NULL, &len, NULL, 0);
-    if (result == 0) {
-        variant = (char *)malloc(len + 2);
-        variant[0] = '_';
-        result = sysctlbyname("kern.osbuildconfig", &variant[1], &len, NULL, 0);
-        if (result == 0) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogDebugLevel,
-                "variant is %s",variant);
-            if (strcmp(&variant[1], "release") != 0) {
-               OSKextSetExecutableSuffix(variant, NULL);
-            }
-        } else {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogErrorLevel,
-                "kern.osbuildconfig failed after reporting return size of size %d",(int) len);
-        }
-        free(variant);
-    } else {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel,
-            "Impossible to query kern.osbuildconfig");
-    }
-}

@@ -9,10 +9,7 @@
 #include "kextutil_main.h"
 #include "kext_tools_util.h"
 #include "security.h"
-#include "staging.h"
-#include "syspolicy.h"
 #include "bootcaches.h"
-#include "kextaudit.h"
 
 #include <libc.h>
 #include <sysexits.h>
@@ -46,15 +43,6 @@ static mach_port_t sKextdPort = MACH_PORT_NULL;
 static mach_port_t sLockPort = MACH_PORT_NULL;     // kext loading lock 
 static int sLockStatus = 0;
 static bool sLockTaken = false;
-
-// Simple helper macro that will only assign code to var if it's the first failure.
-#define SET_FIRST_FAILURE(var, code) var = ((var == EX_OK) ? (code) : var)
-
-static Boolean
-isRunningAsRoot()
-{
-    return geteuid() == 0;
-}
 
 #pragma mark Main Routine
 /*******************************************************************************
@@ -112,60 +100,10 @@ main(int argc, char * const * argv)
     */
     OSKextSetRecordsDiagnostics(kOSKextDiagnosticsFlagAll);
 
-    /*****
-     * Configure authentication options - allow command line flag to skip all auth checks,
-     * but only if the kext will not eventually be loaded into the running system.  Otherwise,
-     * -z (skipAuthentication) can bypass all security checks.  checkArgs should have already
-     * caught most of these cases, but for safety confirm them here.
-     */
-    Boolean isSecureOperation = toolArgs.doLoad || toolArgs.doStartMatching;
-    Boolean doAuthBypass = toolArgs.skipAuthentication && !isSecureOperation;
-    AuthOptions_t authenticationOptions = {
-        .allowNetwork = true,
-        .isCacheLoad = false,
-        .performFilesystemValidation = !doAuthBypass,
-        .performSignatureValidation = !doAuthBypass,
-        .requireSecureLocation = !doAuthBypass,
-        .respectSystemPolicy = !doAuthBypass,
-    };
-
-    /* System policy checks are meant to be called in the load path only,
-     * so avoid calling them in any scenario where a load could not occur.
-     * Otherwise, this could be a security issue (privilege escalation) when
-     * the user approves.
-     *
-     * Skip this check if the user is not root and is not performing a secure
-     * operation.  checkArgs has already ensured the user is root if any secure
-     * operations will be performed, so this condition is only for diagnostics.
-     *
-     * Technically staging won't work as a non-root user either, but instead of
-     * disabling the security check, leave it enabled and ensure no staging operations
-     * are attempted unless being called as the root user.
-     */
-    if (!isSecureOperation && !isRunningAsRoot()) {
-        authenticationOptions.respectSystemPolicy = false;
-    }
-
-    _OSKextSetAuthenticationFunction(&authenticateKext, &authenticationOptions);
-    _OSKextSetStrictAuthentication(true);
-
-    /* Set up auditing of kext loads, see kextaudit.c */
-    _OSKextSetLoadAuditFunction(&KextAuditLoadCallback);
-    setVariantSuffix();
-
    /*****
     * Create the set of kexts we'll be working from.
-    *
-    * If a secure location is required and the process is running as root, load a staged
-    * copy of all kexts but also keep around a copy of the original kexts because some
-    * of the diagnostic functionality requires lookup by URL.
     */
-    if (authenticationOptions.requireSecureLocation && isRunningAsRoot()) {
-        allKexts = createStagedKextsFromURLs(toolArgs.scanURLs, true);
-    } else {
-        allKexts = OSKextCreateKextsFromURLs(kCFAllocatorDefault, toolArgs.scanURLs);
-    }
-
+    allKexts = OSKextCreateKextsFromURLs(kCFAllocatorDefault, toolArgs.scanURLs);
     if (!allKexts || !CFArrayGetCount(allKexts)) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
@@ -759,7 +697,7 @@ checkArgs(KextutilArgs * toolArgs)
    /*****
     * Check whether the user has permission to load into the kernel.
     */
-    if ((toolArgs->doLoad || toolArgs->doStartMatching) && !isRunningAsRoot()) {
+    if ((toolArgs->doLoad || toolArgs->doStartMatching) && geteuid() != 0) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
             "You must be running as root to load kexts "
@@ -869,9 +807,9 @@ checkArgs(KextutilArgs * toolArgs)
         }
         
         if (useDevelopmentKernel(kernelPathCString)) {
-            if (strlen(kernelPathCString) + strlen(kDefaultDevKernelSuffix) + 1 < sizeof(kernelPathCString)) {
+            if (strlen(kernelPathCString) + strlen(kDefaultKernelSuffix) + 1 < sizeof(kernelPathCString)) {
                 strlcat(kernelPathCString,
-                        kDefaultDevKernelSuffix,
+                        kDefaultKernelSuffix,
                         sizeof(kernelPathCString));
             }
         }
@@ -1246,9 +1184,7 @@ processKext(
     Boolean      * fatal)
 {
     ExitStatus result   = EX_OK;
-    bool       allowed  = FALSE;
     char       kextPathCString[PATH_MAX];
-    OSKextRef  ownedKext = NULL; // must release
 
     if (!CFURLGetFileSystemRepresentation(OSKextGetURL(aKext),
         /* resolveToBase */ false,
@@ -1276,68 +1212,27 @@ processKext(
     }
 
     if (toolArgs->doLoad) {
-        /* Perform staging to ensure the kext is in a SIP protected location.
-         */
-        aKext = createStagedKext(aKext);
-        if (!aKext) {
-            OSKextLog(NULL,
-                      kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
-                      kOSKextLogValidationFlag | kOSKextLogGeneralFlag,
-                      "%s could not be staged, failing.",
-                      kextPathCString);
-            result = kOSKextReturnNotLoadable;
-            goto finish;
-        }
-
-        // aKext returned by staging is owned here, so release it at the end of the loop.
-        ownedKext = aKext;
-
-        /* Since OSKextIsAuthentic performs an exclude list check and considers
-         * the kext not loadable, this check must happen prior to allow proper
-         * logging and notifications.
-         */
-        if (OSKextIsInExcludeList(aKext, false)) {
-            /* notify kextd we are trying to load an excluded kext.
-             * <rdar://problem/12811081>
-             */
-            CFMutableDictionaryRef      myAlertInfoDict = NULL; // must release
-
-            addKextToAlertDict(&myAlertInfoDict, aKext);
-            if (myAlertInfoDict) {
-                postNoteAboutKexts(CFSTR("Excluded Kext Notification"),
-                                   myAlertInfoDict );
-                SAFE_RELEASE(myAlertInfoDict);
+        OSStatus  sigResult = checkKextSignature(aKext, true, false);
+        if ( sigResult != 0 ) {
+            if ( isInvalidSignatureAllowed() ) {
+                OSKextLogCFString(NULL,
+                                  kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+                                  CFSTR("kext-dev-mode allowing invalid signature %ld 0x%02lX for kext \"%s\""),
+                                  (long)sigResult, (long)sigResult, kextPathCString);
             }
-
-            messageTraceExcludedKext(aKext);
-            OSKextLog(NULL,
-                      kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
-                      kOSKextLogValidationFlag | kOSKextLogGeneralFlag,
-                      "%s is in exclude list; omitting.", kextPathCString);
-            result = kOSKextReturnNotLoadable;
-            *fatal = true;
-            goto finish;
+            else {
+                CFStringRef myBundleID;         // do not release
+                
+                myBundleID = OSKextGetIdentifier(aKext);
+                result = kOSKextReturnNotLoadable; // see 13024670
+                OSKextLogCFString(NULL,
+                                  kOSKextLogErrorLevel | kOSKextLogLoadFlag,
+                                  CFSTR("ERROR: invalid signature for %@, will not load"),
+                                  myBundleID ? myBundleID : CFSTR("Unknown"));
+                goto finish;
+            }
         }
-
-        if (!OSKextIsAuthentic(aKext)) {
-            OSKextLog(NULL,
-                      kOSKextLogErrorLevel | kOSKextLogLoadFlag,
-                      "ERROR: authentication checks failed for %s, will not load",
-                      kextPathCString);
-            result = kOSKextReturnNotLoadable;
-            goto finish;
-        }
-
-        if (!OSKextAuthenticateDependencies(aKext)) {
-            OSKextLog(/* kext */ NULL,
-                      kOSKextLogErrorLevel | kOSKextLogLoadFlag |
-                      kOSKextLogDependenciesFlag | kOSKextLogIPCFlag,
-                      "Authentication checks failed in dependencies for kext load request.");
-            result = kOSKextReturnDependencyLoadError;
-            goto finish;
-        }
-
-        allowed = TRUE;
+        
         result = loadKext(aKext, kextPathCString, toolArgs, fatal);
     }
     if (result != EX_OK) {
@@ -1346,7 +1241,7 @@ processKext(
 
     if (toolArgs->doLoad) {
         /* <rdar://problem/12435992> */
-        recordKextLoadForMT(aKext, true);
+        recordKextLoadForMT(aKext);
     }
 
    /* Reread loaded kext info to reflect newly-loaded kexts
@@ -1394,12 +1289,7 @@ processKext(
     }
 
 finish:
-#if HAVE_DANGERZONE
-    if (aKext) {
-        dzRecordKextLoadBypass(aKext, allowed);
-    }
-#endif // HAVE_DANGERZONE
-    SAFE_RELEASE(ownedKext);
+
     return result;
 }
 
@@ -1417,8 +1307,7 @@ runTestsOnKext(
     Boolean        kextLooksGood = true;
     Boolean        tryLink       = false;
     OSKextLogSpec  logFilter     = OSKextGetLogFilter(/* kernel? */ false);
-    OSStatus       sigResult     = 0;
-    OSKextRef      ownedKext     = NULL; // must release
+    OSStatus        sigResult    = 0;
 
    /* Print message if not loadable in safe boot, but keep going
     * for further test results.
@@ -1440,8 +1329,8 @@ runTestsOnKext(
             mustQualify ? "" : "Notice: ",
             kextPathCString);
 
-        if (mustQualify) {
-            SET_FIRST_FAILURE(result, kKextutilExitSafeBoot);
+        if (mustQualify && result == EX_OK) {
+            result = kKextutilExitSafeBoot;
         }
     }
 
@@ -1455,55 +1344,18 @@ runTestsOnKext(
    /* Run the tests for this kext. These would normally be done during
     * a load anyhow, but we need the results up-front. *Always* call
     * the test function before the && so it actually runs; we want all
-    * tests performed, with some exceptions:
-    *
-    * Staging cannot be performed as any non-root user because the user
-    * will not be able to write to the staging location.
-    *
-    * System policy checks are meant to be called in the load path only,
-    * so avoid calling them in any scenario where a load could not occur.
-    * Otherwise, this could be a security issue (privilege escalation) when
-    * the user approves.
-    *
-    * Skip these checks if the process is not running as root.
+    * tests performed.
     */
     kextLooksGood = OSKextValidate(aKext) && kextLooksGood;
     if (!toolArgs->skipAuthentication) {
-        if (isRunningAsRoot()) {
-            ownedKext = createStagedKext(aKext);
-            if (!ownedKext) {
-                OSKextLog(aKext,
-                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                          "Kext failed to stage properly: %s:",
-                          kextPathCString);
-                kextLooksGood = false;
-            } else {
-                // If staging succeeded, make sure theKext refers to the new kext.
-                aKext = ownedKext;
-            }
-        } else {
-            OSKextLog(/* kext */ NULL,
-                      kOSKextLogWarningLevel | kOSKextLogLoadFlag,
-                      "Skipping staging and system policy checks because not running as "
-                      "root, expect staging errors.");
-        }
-
-        if (!OSKextAuthenticate(aKext)) {
-            kextLooksGood = false;
-
-            // If authentication fails and the user is running as root, check
-            // whether it was due to system policy so the tool can fail with
-            // an error code documented in TN2459.
-            if (isRunningAsRoot() && !SPAllowKextLoad(aKext)) {
-                SET_FIRST_FAILURE(result, kKextutilExitSystemPolicy);
-            }
-        }
+         kextLooksGood = OSKextAuthenticate(aKext) && kextLooksGood;
     }
     if (!toolArgs->skipDependencies) {
-        kextLooksGood = OSKextResolveDependencies(aKext) && kextLooksGood;
-        kextLooksGood = OSKextValidateDependencies(aKext) && kextLooksGood;
+         kextLooksGood = OSKextResolveDependencies(aKext) && kextLooksGood;
+         kextLooksGood = OSKextValidateDependencies(aKext) && kextLooksGood;
         if (!toolArgs->skipAuthentication) {
-            kextLooksGood = OSKextAuthenticateDependencies(aKext) && kextLooksGood;
+             kextLooksGood = OSKextAuthenticateDependencies(aKext) &&
+                 kextLooksGood;
         }
     }
 
@@ -1517,32 +1369,32 @@ runTestsOnKext(
 
     /* Check code signature for diagnotic messages.  
      */
-    sigResult = checkKextSignature(aKext, false, true);
-    if (sigResult != errSecSuccess) {
-        if ((logFilter & kOSKextLogLevelMask) >= kOSKextLogErrorLevel) {
-            OSKextLog(aKext,
-                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                      "Code Signing Failure: %s",
-                      (sigResult == errSecCSUnsigned
-                       ? "not code signed" : "code signature is invalid") );
-            OSKextLogDiagnostics(aKext, kOSKextDiagnosticsFlagAll);
-        }
-    }
+    sigResult = checkKextSignature(aKext, false, false);
 
    /*****
-    * Print diagnostics/warnings as needed, set failure status if kext can't be used and
-    * no other check has already set a specific failure status.
+    * Print diagnostics/warnings as needed, set status if kext can't be used.
     */
-    if (!kextLooksGood) {
+    if (!kextLooksGood || sigResult != 0) {
         if ((logFilter & kOSKextLogLevelMask) >= kOSKextLogErrorLevel) {
             OSKextLog(aKext,
                 kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
                 "Diagnostics for %s:",
                 kextPathCString);
+
             OSKextLogDiagnostics(aKext, kOSKextDiagnosticsFlagAll);
+            if (sigResult != 0) {
+                OSKextLog(aKext,
+                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
+                          "Code Signing Failure: %s",
+                          (sigResult == errSecCSUnsigned
+                          ? "not code signed"
+                          : "code signature is invalid") );
+            }
         }
-        SET_FIRST_FAILURE(result, kKextutilExitKextBad);
-        goto finish;
+        if (!kextLooksGood) {
+            result = kKextutilExitKextBad;
+            goto finish;
+        }
     }
 
    /* Print diagnostics/warnings as needed, set status if kext can't be used.
@@ -1588,7 +1440,6 @@ runTestsOnKext(
 #endif
 
 finish:
-    SAFE_RELEASE(ownedKext);
     return result;
 }
 
@@ -1606,6 +1457,30 @@ loadKext(
     OSKextExcludeLevel matchExclude     = toolArgs->interactiveLevel;
     CFArrayRef         personalityNames = toolArgs->personalityNames;
     OSReturn           loadResult       = kOSReturnError;
+    
+    if (OSKextIsInExcludeList(aKext, false)) {
+#if 1 // <rdar://problem/12811081>
+        /* notify kextd we are trying to load an excluded kext.
+         */
+        CFMutableDictionaryRef      myAlertInfoDict = NULL; // must release
+        
+        addKextToAlertDict(&myAlertInfoDict, aKext);
+        if (myAlertInfoDict) {
+            postNoteAboutKexts(CFSTR("Excluded Kext Notification"),
+                               myAlertInfoDict );
+            SAFE_RELEASE(myAlertInfoDict);
+        }
+#endif
+
+        messageTraceExcludedKext(aKext);
+        OSKextLog(NULL,
+                  kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
+                  kOSKextLogValidationFlag | kOSKextLogGeneralFlag,
+                  "%s is in exclude list; omitting.", kextPathCString);
+        result = kOSKextReturnNotLoadable;
+        *fatal = true;
+        goto finish;
+    }
 
    /* INTERACTIVE: ask if ok to load kext and its dependencies
     */

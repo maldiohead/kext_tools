@@ -32,44 +32,16 @@ size_t lzvn_encode_work_size(void);
 
 #include <IOKit/kext/OSKext.h>
 #include <IOKit/kext/OSKextPrivate.h>
-#include <libgen.h> // dirname()
 
 /*******************************************************************************
 *******************************************************************************/
-ExitStatus
+ExitStatus 
 writeFatFile(
-             const char                * filePath,
-             CFArrayRef                  fileSlices,
-             CFArrayRef                  fileArchs,
-             mode_t                      fileMode,
-             const struct timeval        fileTimes[2])
-{
-    ExitStatus        result               = EX_SOFTWARE;
-    
-    result = writeFatFileWithValidation(filePath,
-                                        FALSE,
-                                        0,
-                                        0,
-                                        fileSlices,
-                                        fileArchs,
-                                        fileMode,
-                                        fileTimes);
-    
-    return result;
-}
-
-/*******************************************************************************
- *******************************************************************************/
-ExitStatus
-writeFatFileWithValidation(
-                           const char                * filePath,
-                           boolean_t                   doValidation,
-                           dev_t                       file_dev_t,
-                           ino_t                       file_ino_t,
-                           CFArrayRef                  fileSlices,
-                           CFArrayRef                  fileArchs,
-                           mode_t                      fileMode,
-                           const struct timeval        fileTimes[2])
+    const char                * filePath,
+    CFArrayRef                  fileSlices,
+    CFArrayRef                  fileArchs,
+    mode_t                      fileMode,
+    const struct timeval        fileTimes[2])
 {
     ExitStatus        result               = EX_SOFTWARE;
     char              tmpPath[PATH_MAX];
@@ -83,195 +55,121 @@ writeFatFileWithValidation(
     uint32_t          fatOffset            = 0;
     uint32_t          sliceLength          = 0;
     int               fileDescriptor       = -1;      // must close
-    int               numArchs             = 0;
+    int                numArchs            = 0;
     int               i                    = 0;
-    int               from_dir_fd          = -1;
-    int               to_dir_fd            = -1;
-    char              from_base_name[64];
-    char *            from_base_name_ptr    = &from_base_name[0];
-    size_t            from_base_name_size   = 0;
-    char              to_base_name[64];
-    char *            to_base_name_ptr      = &to_base_name[0];
-    size_t            to_base_name_size     = 0;
-    
+
     /* Make the temporary file */
-    
+
     strlcpy(tmpPath, filePath, sizeof(tmpPath));
     if (strlcat(tmpPath, ".XXXX", sizeof(tmpPath)) >= sizeof(tmpPath)) {
         OSKextLogStringError(/* kext */ NULL);
         goto finish;
     }
-    
+
     fileDescriptor = mkstemp(tmpPath);
     if (-1 == fileDescriptor) {
         OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't create %s - %s.",
-                  tmpPath, strerror(errno));
+                kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+                "Can't create %s - %s.",
+                tmpPath, strerror(errno));
         goto finish;
     }
-    
+
     /* Set the file's permissions */
-    
+
     /* Set the umask to get it, then set it back to iself. Wish there were a
      * better way to query it.
      */
     procMode = umask(0);
     umask(procMode);
-    
+
     if (-1 == fchmod(fileDescriptor, fileMode & ~procMode)) {
         OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't set permissions on %s - %s.",
-                  tmpPathPtr, strerror(errno));
+                kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+                "Can't set permissions on %s - %s.",
+                tmpPathPtr, strerror(errno));
     }
-    
+
     /* Write out the fat headers even if there's only one arch so we know what
      * arch a compressed prelinked kernel belongs to.
      */
-    
+
     numArchs = (int)CFArrayGetCount(fileArchs);
     fatHeader.magic = OSSwapHostToBigInt32(FAT_MAGIC);
     fatHeader.nfat_arch = OSSwapHostToBigInt32(numArchs);
-    
+
     result = writeToFile(fileDescriptor, (const UInt8 *)&fatHeader,
-                         sizeof(fatHeader));
+        sizeof(fatHeader));
     if (result != EX_OK) {
         goto finish;
     }
-    
+
     fatOffset = sizeof(struct fat_header) +
-    (sizeof(struct fat_arch) * numArchs);
-    
+        (sizeof(struct fat_arch) * numArchs);
+
     for (i = 0; i < numArchs; i++) {
         targetArch = CFArrayGetValueAtIndex(fileArchs, i);
         sliceData = CFArrayGetValueAtIndex(fileSlices, i);
         sliceLength = (uint32_t)CFDataGetLength(sliceData);
-        
+
         fatArch.cputype = OSSwapHostToBigInt32(targetArch->cputype);
         fatArch.cpusubtype = OSSwapHostToBigInt32(targetArch->cpusubtype);
         fatArch.offset = OSSwapHostToBigInt32(fatOffset);
         fatArch.size = OSSwapHostToBigInt32(sliceLength);
         fatArch.align = OSSwapHostToBigInt32(0);
-        
-        result = writeToFile(fileDescriptor,
-                             (UInt8 *)&fatArch, sizeof(fatArch));
+
+        result = writeToFile(fileDescriptor, 
+            (UInt8 *)&fatArch, sizeof(fatArch));
         if (result != EX_OK) {
             goto finish;
         }
-        
+
         fatOffset += sliceLength;
     }
-    
+
     /* Write out the file slices */
+
     for (i = 0; i < numArchs; i++) {
         sliceData = CFArrayGetValueAtIndex(fileSlices, i);
         sliceDataPtr = CFDataGetBytePtr(sliceData);
         sliceLength = (uint32_t)CFDataGetLength(sliceData);
-        
+
         result = writeToFile(fileDescriptor, sliceDataPtr, sliceLength);
         if (result != EX_OK) {
             goto finish;
         }
     }
-    
-    from_base_name_size = strlen(basename((char *)tmpPathPtr)) + 1;
-    if (from_base_name_size > sizeof(from_base_name)) {
-        from_base_name_ptr = malloc(from_base_name_size);
-        if (from_base_name_ptr == NULL) {
-            OSKextLogMemError();
-            goto finish;
-        }
-    }
-    if (strlcpy(from_base_name_ptr, basename((char *)tmpPathPtr), from_base_name_size) >= from_base_name_size) {
-        OSKextLogStringError(/* kext */ NULL);
-        goto finish;
-    }
-    if (-1 == (from_dir_fd = open(dirname((char *)tmpPathPtr), O_RDONLY, 0))) {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't open '%s' - %s.",
-                  dirname((char *)tmpPathPtr), strerror(errno));
-        goto finish;
-    }
-    
-    to_base_name_size = strlen(basename((char *)filePath)) + 1;
-    if (to_base_name_size > sizeof(to_base_name)) {
-        to_base_name_ptr = malloc(to_base_name_size);
-        if (to_base_name_ptr == NULL) {
-            OSKextLogMemError();
-            goto finish;
-        }
-    }
-    if (strlcpy(to_base_name_ptr, basename((char *)filePath), to_base_name_size) >= to_base_name_size) {
-        OSKextLogStringError(/* kext */ NULL);
-        goto finish;
-    }
-    if (-1 == (to_dir_fd = open(dirname((char *)filePath), O_RDONLY, 0))) {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't open '%s' - %s.",
-                  dirname((char *)filePath), strerror(errno));
-        goto finish;
-    }
-    
-    if (doValidation) {
-        /* check to make sure our target path has not changed */
-        if (isSameFileDevAndIno(to_dir_fd,
-                                to_base_name_ptr,
-                                false, /* don't follow symlinks */
-                                file_dev_t,
-                                file_ino_t) == FALSE) {
-            OSKextLog(/* kext */ NULL,
-                      kOSKextLogErrorLevel  | kOSKextLogGeneralFlag,
-                      "File at path '%s' changed, cannot be used",
-                      filePath);
-            result = EX_NOPERM;
-            goto finish;
-        }
-    }
-    
-    /* Move the file to its final path */
+
     OSKextLog(/* kext */ NULL,
-              kOSKextLogDebugLevel | kOSKextLogFileAccessFlag,
-              "Renaming temp file '%s' to '%s' ",
-              from_base_name_ptr, to_base_name_ptr);
-    
-    if (renameat(from_dir_fd, from_base_name_ptr,
-                 to_dir_fd, to_base_name_ptr) != 0) {
+        kOSKextLogDebugLevel | kOSKextLogFileAccessFlag,
+        "Renaming temp file to %s.",
+        filePath);
+
+    /* Move the file to its final path */
+
+    if (rename(tmpPathPtr, filePath) != 0) {
         OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't rename temporary file '%s' to '%s' - %s.",
-                  from_base_name_ptr, to_base_name_ptr, strerror(errno));
+                kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+                "Can't rename temporary file %s to %s - %s.",
+                tmpPathPtr, filePath, strerror(errno));
         result = EX_OSERR;
         goto finish;
     }
     tmpPathPtr = NULL;
     
     /* Update the file's mod time if necessary */
+    
     if (utimes(filePath, fileTimes)) {
         OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Can't update mod time of %s - %s.", filePath, strerror(errno));
+            kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
+            "Can't update mod time of %s - %s.", filePath, strerror(errno));
     }
-    
+
 finish:
-    
+
     if (fileDescriptor >= 0) (void)close(fileDescriptor);
     if (tmpPathPtr) unlink(tmpPathPtr);
-    if (from_dir_fd != -1) {
-        close(from_dir_fd);
-    }
-    if (to_dir_fd != -1) {
-        close(to_dir_fd);
-    }
-    if (from_base_name_ptr != NULL && from_base_name_ptr != &from_base_name[0]) {
-        free(from_base_name_ptr);
-    }
-    if (to_base_name_ptr != NULL && to_base_name_ptr != &to_base_name[0]) {
-        free(to_base_name_ptr);
-    }
-    
+
     return result;
 }
 
@@ -447,59 +345,35 @@ finish:
 }
 
 /*******************************************************************************
- *******************************************************************************/
-ExitStatus
-readFatFileArchsWith_fd(
-                         int                the_fd,
-                         CFMutableArrayRef * archsOut)
-{
-    ExitStatus          result          = EX_SOFTWARE;
-    void              * headerPage      = NULL;         // must unmapFatHeaderPage()
-    
-    /* Map the fat headers in */
-    
-    headerPage = mapAndSwapFatHeaderPage(the_fd);
-    if (!headerPage) {
-        goto finish;
-    }
-    
-    result = readFatFileArchsWithHeader(headerPage, archsOut);
-finish:
-    if (headerPage) unmapFatHeaderPage(headerPage);
-    
-    return result;
-}
-
-/*******************************************************************************
- *******************************************************************************/
+*******************************************************************************/
 ExitStatus
 readFatFileArchsWithPath(
-                         const char        * filePath,
-                         CFMutableArrayRef * archsOut)
+    const char        * filePath,
+    CFMutableArrayRef * archsOut)
 {
     ExitStatus          result          = EX_SOFTWARE;
     void              * headerPage      = NULL;         // must unmapFatHeaderPage()
     int                 fileDescriptor  = 0;            // must close()
-    
+
     /* Open the file. */
-    
+
     fileDescriptor = open(filePath, O_RDONLY);
     if (fileDescriptor < 0) {
         goto finish;
     }
-    
+
     /* Map the fat headers in */
-    
+
     headerPage = mapAndSwapFatHeaderPage(fileDescriptor);
     if (!headerPage) {
         goto finish;
     }
-    
+
     result = readFatFileArchsWithHeader(headerPage, archsOut);
 finish:
     if (fileDescriptor >= 0) close(fileDescriptor);
     if (headerPage) unmapFatHeaderPage(headerPage);
-    
+
     return result;
 }
 
@@ -575,34 +449,6 @@ readMachOSlices(
     mode_t            * modeOut,
     struct timeval      machOTimesOut[2])
 {
-    ExitStatus          result          = EX_SOFTWARE;
-    int                 fileDescriptor  = 0;    // must close()
-
-    /* Open the file. */
-    fileDescriptor = open(filePath, O_RDONLY);
-    if (fileDescriptor < 0) {
-        goto finish;
-    }
-
-    result = readMachOSlicesWith_fd(fileDescriptor, slicesOut,
-                                    archsOut, modeOut, machOTimesOut);
-
-finish:
-    if (fileDescriptor >= 0) close(fileDescriptor);
-
-    return result;
-}
-
-/*******************************************************************************
- *******************************************************************************/
-ExitStatus
-readMachOSlicesWith_fd(
-    int                 the_fd,
-    CFMutableArrayRef * slicesOut,
-    CFMutableArrayRef * archsOut,
-    mode_t            * modeOut,
-    struct timeval      machOTimesOut[2])
-{
     struct stat         statBuf;
     ExitStatus          result          = EX_SOFTWARE;
     CFMutableArrayRef   fileSlices      = NULL;         // release
@@ -611,59 +457,67 @@ readMachOSlicesWith_fd(
     u_char            * fileBuf         = NULL;         // must free
     void              * headerPage      = NULL;         // must unmapFatHeaderPage()
     struct fat_arch   * fatArch         = NULL;         // do not free
-    
+    int                 fileDescriptor  = 0;            // must close()
+
     /* Create an array to hold the fat slices */
-    
+
     if (!createCFMutableArray(&fileSlices, &kCFTypeArrayCallBacks))
     {
         OSKextLogMemError();
         result = EX_OSERR;
         goto finish;
     }
-    
-    if (fstat(the_fd, &statBuf)) {
+
+    /* Open the file. */
+
+    fileDescriptor = open(filePath, O_RDONLY);
+    if (fileDescriptor < 0) {
         goto finish;
     }
-    
+
+    if (fstat(fileDescriptor, &statBuf)) {
+        goto finish;
+    }
+
     /* Map the fat headers in */
-    
-    headerPage = mapAndSwapFatHeaderPage(the_fd);
+
+    headerPage = mapAndSwapFatHeaderPage(fileDescriptor);
     if (!headerPage) {
         goto finish;
     }
-    
+
     /* If the file is fat, read the slices into separate objects.  If not,
      * read the whole file into one large slice.
      */
-    
+
     fatArch = getFirstFatArch(headerPage);
     if (fatArch) {
         while (fatArch) {
-            sliceData = readMachOSlice(the_fd,
-                                       fatArch->offset, fatArch->size);
+            sliceData = readMachOSlice(fileDescriptor,
+                fatArch->offset, fatArch->size);
             if (!sliceData) goto finish;
-            
+
             CFArrayAppendValue(fileSlices, sliceData);
             fatArch = getNextFatArch(headerPage, fatArch);
             CFRelease(sliceData); // drop ref from readMachOSlice()
             sliceData = NULL;
         }
     } else {
-        sliceData = readMachOSlice(the_fd, 0, (size_t)statBuf.st_size);
+        sliceData = readMachOSlice(fileDescriptor, 0, (size_t)statBuf.st_size);
         if (!sliceData) goto finish;
-        
+
         CFArrayAppendValue(fileSlices, sliceData);
     }
-    
+
     if (archsOut) {
         result = readFatFileArchsWithHeader(headerPage, &fileArchs);
         if (result != EX_OK) {
             goto finish;
         }
-        
+
         if (!fileArchs) archsOut = NULL;
     }
-    
+
     result = EX_OK;
     if (slicesOut) *slicesOut = (CFMutableArrayRef) CFRetain(fileSlices);
     if (archsOut) *archsOut = (CFMutableArrayRef) CFRetain(fileArchs);
@@ -672,14 +526,15 @@ readMachOSlicesWith_fd(
         TIMESPEC_TO_TIMEVAL(&machOTimesOut[0], &statBuf.st_atimespec);
         TIMESPEC_TO_TIMEVAL(&machOTimesOut[1], &statBuf.st_mtimespec);
     }
-    
+
 finish:
     SAFE_RELEASE(fileSlices);
     SAFE_RELEASE(fileArchs);
     SAFE_RELEASE(sliceData);
     SAFE_FREE(fileBuf);
+    if (fileDescriptor >= 0) close(fileDescriptor);
     if (headerPage) unmapFatHeaderPage(headerPage);
-    
+
     return result;
 }
 
@@ -692,8 +547,15 @@ readMachOSliceForArch(
     Boolean             checkArch)
 {   
     CFDataRef           result          = NULL; // must release
+    CFDataRef           fileData        = NULL; // must release
+    void              * headerPage      = NULL; // must unmapFatHeaderPage()
+    struct fat_header * fatHeader       = NULL; // do not free
+    struct fat_arch   * fatArch         = NULL; // do not free
     int                 fileDescriptor  = 0;    // must close()
- 
+    off_t               fileSliceOffset = 0;
+    size_t              fileSliceSize   = 0;
+    struct stat statBuf;
+
     /* Open the file */
 
     fileDescriptor = open(filePath, O_RDONLY);
@@ -701,89 +563,64 @@ readMachOSliceForArch(
         goto finish;
     }
 
-    result = readMachOSliceForArchWith_fd(fileDescriptor, archInfo, checkArch);
-
-finish:
-    if (fileDescriptor >= 0) close(fileDescriptor);
-
-    return result;
-}
-
-
-/*******************************************************************************
- *******************************************************************************/
-CFDataRef
-readMachOSliceForArchWith_fd(
-    int                   the_fd,
-    const NXArchInfo *    archInfo,
-    Boolean               checkArch)
-{
-    CFDataRef           result          = NULL; // must release
-    CFDataRef           fileData        = NULL; // must release
-    void              * headerPage      = NULL; // must unmapFatHeaderPage()
-    struct fat_header * fatHeader       = NULL; // do not free
-    struct fat_arch   * fatArch         = NULL; // do not free
-    off_t               fileSliceOffset = 0;
-    size_t              fileSliceSize   = 0;
-    struct stat statBuf;
-    
     /* Map the fat headers in */
-    
-    headerPage = mapAndSwapFatHeaderPage(the_fd);
+
+    headerPage = mapAndSwapFatHeaderPage(fileDescriptor);
     if (!headerPage) {
         goto finish;
     }
-    
+
     /* Find the slice for the target architecture */
-    
+
     fatHeader = (struct fat_header *)headerPage;
-    
+
     if (archInfo && fatHeader->magic == FAT_MAGIC) {
-        fatArch = NXFindBestFatArch(archInfo->cputype, archInfo->cpusubtype,
-                                    (struct fat_arch *)(&fatHeader[1]), fatHeader->nfat_arch);
+        fatArch = NXFindBestFatArch(archInfo->cputype, archInfo->cpusubtype, 
+            (struct fat_arch *)(&fatHeader[1]), fatHeader->nfat_arch);
         if (!fatArch) {
             OSKextLog(/* kext */ NULL,
-                      kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                      "Fat file does not contain requested architecture %s.",
-                      archInfo->name);
+                    kOSKextLogErrorLevel | kOSKextLogGeneralFlag, 
+                    "Fat file does not contain requested architecture %s.",
+                    archInfo->name);
             goto finish;
         }
-        
+
         fileSliceOffset = fatArch->offset;
         fileSliceSize = fatArch->size;
     } else {
-        if (fstat(the_fd, &statBuf)) {
+        if (fstat(fileDescriptor, &statBuf)) {
             goto finish;
         }
-        
+
         fileSliceOffset = 0;
         fileSliceSize = (size_t)statBuf.st_size;
     }
-    
-    /* Read the file */
-    
-    fileData = readMachOSlice(the_fd, fileSliceOffset,
-                              fileSliceSize);
+
+    /* Read the file */    
+
+    fileData = readMachOSlice(fileDescriptor, fileSliceOffset, 
+        fileSliceSize);
     if (!fileData) {
         goto finish;
     }
-    
+
     /* Verify that the file is of the right architecture */
-    
+
     if (checkArch) {
-        if (verifyMachOIsArch(CFDataGetBytePtr(fileData),
-                              fileSliceSize, archInfo))
+        if (verifyMachOIsArch(CFDataGetBytePtr(fileData), 
+                fileSliceSize, archInfo)) 
         {
             goto finish;
         }
     }
-    
+
     result = CFRetain(fileData);
-    
+
 finish:
     SAFE_RELEASE(fileData);
+    if (fileDescriptor >= 0) close(fileDescriptor);
     if (headerPage) unmapFatHeaderPage(headerPage);
-    
+
     return result;
 }
 

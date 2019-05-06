@@ -65,7 +65,6 @@
 #include "fork_program.h"
 #include "kext_tools_util.h"
 #include "safecalls.h"
-#include "signposts.h"
 
 // only used here
 #define kBRDiskArbMaxRetries   (10)
@@ -181,6 +180,7 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
     CFIndex keyCount;       // track whether we've handled all keys
     CFIndex rpsindex = 0;   // index into rps; compared to caches->nrps @ end
     CFStringRef str;        // used to point to objects owned by others
+    CFStringRef createdStr = NULL;
 
     rval = EFTYPE;
     keyCount = CFDictionaryGetCount(bcDict);        // start with the top
@@ -235,12 +235,14 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
             caches->label = &caches->miscpaths[miscindex];
 
             miscindex++;    // get ready for the next guy
+#pragma unused(miscindex)
             keyCount--;     // DiskLabel is dealt with
         }
 
         // add new keys here
         keyCount--;     // preboot dict
     }
+
 
     // process booter keys
     dict = (CFDictionaryRef)CFDictionaryGetValue(bcDict, kBCBootersKey);
@@ -419,7 +421,6 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV1Key)) kcacheKeys++;
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV2Key)) kcacheKeys++;
         if (CFDictionaryContainsKey(dict, kBCKernelcacheV3Key)) kcacheKeys++;
-        if (CFDictionaryContainsKey(dict, kBCKernelcacheV4Key)) kcacheKeys++;
 
         if (kcacheKeys > 1) { 
             // don't support multiple types of kernel caching ...
@@ -437,9 +438,6 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
             }
             if (!mkDict) {
                 mkDict = (CFDictionaryRef)CFDictionaryGetValue(dict, kBCKernelcacheV3Key);
-            }
-            if (!mkDict) {
-                mkDict = (CFDictionaryRef)CFDictionaryGetValue(dict, kBCKernelcacheV4Key);
             }
 
             if (mkDict) {
@@ -459,10 +457,12 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
                 goto finish;
             }
 
-            // path to the prelinkedkernel
+            // path to the cache itself
+            // currently /System/Library/Caches/com.apple.kext.caches/Startup/kernelcache
             str = (CFStringRef)CFDictionaryGetValue(mkDict, kBCPathKey);
-            MAKE_CACHEDPATH(&caches->rpspaths[rpsindex], caches, str);
+            MAKE_CACHEDPATH(&caches->rpspaths[rpsindex], caches, str);   // M
             caches->kext_boot_cache_file = &caches->rpspaths[rpsindex++];
+#pragma unused(rpsindex)
 
             // Starting with Kernelcache v1.3 kBCExtensionsDirKey is a key for
             // an array of paths to extensions directory. Pre v1.3 it is just
@@ -525,7 +525,7 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
                 }
             }
 
-            // prelinked kernels have a kernel path key, which we set up by hand
+            // kernelcaches have a kernel path key, which we set up by hand
             if (isKernelcache) {
                 // <= 10.9 - /Volumes/foo/mach_kernel
                 // > 10.9 - /Volumes/foo/System/Library/Kernels/kernel
@@ -542,6 +542,7 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
 #if DEV_KERNEL_SUPPORT
                 getExtraKernelCachePaths(caches);
 #endif
+                
             }
  
             // Archs are fetched from the cacheinfo dictionary when needed
@@ -557,6 +558,7 @@ extractProps(struct bootCaches *caches, CFDictionaryRef bcDict)
     }
 
 finish:
+    if (createdStr)     CFRelease(createdStr);
     if (rval != 0 && caches->exts != NULL) {
         free(caches->exts);
         caches->exts = NULL;
@@ -572,9 +574,9 @@ finish:
  * creates and populates extraKernelCachePaths.  Also sets kernelsCount.
  * Looks for any kernel files in the format of "kernel.SUFFIX" in 
  * /System/Library/Kernels then uses SUFFIX to create the corresponding 
- * prelinkedkernel.SUFFIX path.
+ * kernelcache.SUFFIX path.
  *
- * NOTE, we already have the prelinkedkernel path for the "kernel" file as part of
+ * NOTE, we already have the kernelcache path for the "kernel" file as part of
  * rpspaths so we do not add it to extraKernelCachePaths (thus "extra").  And
  * that is why nekcp is one less than bootCaches.kernelsCount.
  */
@@ -657,17 +659,11 @@ getExtraKernelCachePaths(struct bootCaches *caches)
             caches->kernelsCount++;
             continue;
         }
-     
+      
         // only want kernel.SUFFIX from here on
         if (CFStringHasPrefix(tmpCFString,
                               CFSTR("kernel.")) == false) {
             continue;
-        }
-        
-        // skip "dSYM" suffix - 18098771
-        if (CFStringHasSuffix(tmpCFString,
-                              CFSTR("dSYM"))) {
-           continue;
         }
 
         // skip any kernels with more than one '.' character.
@@ -688,7 +684,7 @@ getExtraKernelCachePaths(struct bootCaches *caches)
         tmpCFString =  CFURLCopyPathExtension(enumURL);
         if (tmpCFString == NULL)   continue;
         
-        // build prelinkedkernel file for each valid kernel suffix we find.
+        // build kernelcache file for each valid kernel suffix we find.
         suffixPtr = createUTF8CStringForCFString(tmpCFString);
         if (suffixPtr == NULL)    continue;
         
@@ -912,7 +908,8 @@ readBootCaches(char *volRoot, BRUpdateOpts_t opts)
     caches = calloc(1, sizeof(*caches));
     if (!caches)            goto finish;
     caches->cachefd = -1;       // set cardinal (fd 0 valid)
-    if (strlcpy(caches->root, volRoot, sizeof(caches->root)) >= sizeof(caches->root)) goto finish;
+    pathcpy(caches->root, volRoot);
+
     errmsg = "error opening " kBootCachesPath;
     pathcpy(bcpath, caches->root);
     pathcat(bcpath, kBootCachesPath);
@@ -1077,10 +1074,6 @@ needsUpdate(char *root, cachedPath* cpath)
     // check the source file in the root volume
     if (stat(fullrp, &rsb) == 0) {
         rfpresent = true;
-        // zero means "no file exists"; if file's ctime is 0, force to 1
-        if (rsb.st_ctimespec.tv_sec == 0) {
-            rsb.st_ctimespec.tv_sec = 1;
-        }
     } else if (errno == ENOENT) {
         rfpresent = false;
     } else {
@@ -1103,7 +1096,7 @@ needsUpdate(char *root, cachedPath* cpath)
     }
 
     // check on the timestamp file itself
-    // A zero time means that no root file exists (-> stamp is invalid).
+    // it's invalid if it tracks a non-existant root file
     if (stat(fulltsp, &tsb) == 0) {
         if (tsb.st_mtimespec.tv_sec != 0) {
             tsvalid = true;
@@ -1195,10 +1188,6 @@ needUpdates(struct bootCaches *caches, BRUpdateOpts_t opts,
 
     // first check RPS paths
     for (cp = caches->rpspaths; cp < &caches->rpspaths[caches->nrps]; cp++) {
-        // if we've managed to boot, out of date EFILoginResources are fine
-        if ((opts & kBRUEarlyBoot) && cp == caches->efiloccache) {
-            continue;       // ignore EFILoginLocalizations during early boot
-        }
         if (needsUpdate(caches->root, cp)) {
             OSKextLog(NULL, oodLogSpec, "%s " OODMSG, cp->rpath);
             anyOOD = rpsOOD = true;
@@ -1492,12 +1481,12 @@ finish:
 int
 rebuild_kext_boot_cache_file(
     struct bootCaches *caches,
+    Boolean wait,
     const char * kext_boot_cache_file,
-    const char * kernel_file,
-    Boolean startup_kexts_ok,
-    Boolean rebuild_immutable_kernel)
-{
+    const char * kernel_file)
+{   
     int             rval                    = ELAST + 1;
+    int             pid                     = -1;
     CFIndex i, argi = 0, argc = 0, narchs = 0;
     CFDictionaryRef pbDict, mkDict;
     CFArrayRef      archArray;
@@ -1511,12 +1500,13 @@ rebuild_kext_boot_cache_file(
     char            fullkernelp[PATH_MAX] = "";
     Boolean         generateKernelcache     = false;
     int             mkextVersion            = 0;
-    
-    // bootcaches.plist might not request mkext/prelinkedkernel rebuilds
-    if (!caches->kext_boot_cache_file) {
+
+    // bootcaches.plist might not request mkext/kernelcache rebuilds
+    if (!caches->kext_boot_cache_file
+    ) {
        goto finish;
     }
-
+    
     fullextsp = malloc(caches->nexts * PATH_MAX);
     if (!fullextsp)  goto finish;
     *fullextsp = 0x00;
@@ -1528,14 +1518,10 @@ rebuild_kext_boot_cache_file(
     */
     do {
         mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV1Key);
-        if (!mkDict) {
+        if (!mkDict)
             mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV2Key);
-        }
         if (!mkDict) {
             mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV3Key);
-        }
-        if (!mkDict) {
-            mkDict = CFDictionaryGetValue(pbDict, kBCKernelcacheV4Key);
         }
 
         if (mkDict) {
@@ -1559,7 +1545,7 @@ rebuild_kext_boot_cache_file(
 
     if (!mkDict || CFGetTypeID(mkDict) != CFDictionaryGetTypeID())  goto finish;
 
-    archArray = CFDictionaryGetValue(mkDict, kBCArchsKey);
+        archArray = CFDictionaryGetValue(mkDict, kBCArchsKey);
     if (archArray) {
         narchs = CFArrayGetCount(archArray);
         archstrs = calloc(narchs, sizeof(char*));
@@ -1594,29 +1580,22 @@ rebuild_kext_boot_cache_file(
         kcargs[argi++] = archstrs[i];
     }
 
-    if (rebuild_immutable_kernel) {
-        // rebuilding the immutable kernel implies
-        //     -local-root and -network-root (and "root" and "console")
-        kcargs[argi++] = "-immutable-kexts";
-        kcargs[argi++] = "-build-immutable-kernel";
-    } else {
-        // BootRoot always includes local kexts
-        kcargs[argi++] = "-local-root";
+    // BootRoot always includes local kexts
+    kcargs[argi++] = "-local-root";
 
-        // 6413843 check if it's installation media (-> add -n)
-        pathcpy(rcpath, caches->root);
-        removeTrailingSlashes(rcpath);       // X caches->root trailing '/'?
-        pathcat(rcpath, "/etc/rc.cdrom");
-        if (stat(rcpath, &sb) == 0) {
-            kcargs[argi++] = "-network-root";
-        }
+    // 6413843 check if it's installation media (-> add -n)
+    pathcpy(rcpath, caches->root);
+    removeTrailingSlashes(rcpath);       // X caches->root trailing '/'?
+    pathcat(rcpath, "/etc/rc.cdrom");
+    if (stat(rcpath, &sb) == 0) {
+        kcargs[argi++] = "-network-root";
     }
 
     // determine proper argument to precede kext_boot_cache_file
     if (generateKernelcache) {
         // for '/' only, include all kexts loaded since boot (9130863)
         // TO DO: can we optimize for the install->first boot case?
-        if (0 == strcmp(caches->root, "/") && startup_kexts_ok && !rebuild_immutable_kernel) {
+        if (0 == strcmp(caches->root, "/")) {
             kcargs[argi++] = "-all-loaded";
         }
         pathcpy(fullkernelp, caches->root);
@@ -1677,17 +1656,24 @@ rebuild_kext_boot_cache_file(
         }
 
     }
+    rval = 0;
 
-    /* wait:true means the return value is <0 for spawn failures and
-     * the exit status of the forked process (>=0) otherwise.
-     */
-    rval = fork_program("/usr/sbin/kextcache", kcargs, true /*wait*/);  // logs
+   /* wait:false means the return value is <0 for fork/exec failures and
+    * the pid of the forked process if >0.
+    *
+    * wait:true means the return value is <0 for fork/exec failures and
+    * the exit status of the forked process (>=0) otherwise.
+    */
+    pid = fork_program("/usr/sbin/kextcache", kcargs, wait);  // logs errors
 
 finish:
-    if (rval == ELAST + 1) {
+    if (rval) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-            "Data error before rebuild of primary kext cache");
+            "Data error before mkext rebuild.");
+    }
+    if (wait || pid < 0) {
+        rval = pid;
     }
 
     if (archstrs) {
@@ -1737,9 +1723,7 @@ plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo)
         if (!_OSKextReadCache(directoryURL, CFSTR(_kOSKextIdentifierCacheBasename),
             /* arch */ NULL, _kOSKextCacheFormatCFBinary, /* parseXML? */ false,
             /* valuesOut*/ NULL)) {
-            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
-                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
-                                   "kext identifier cache out of date: %@", directoryURL);
+
             goto finish;
         }
     }
@@ -1759,9 +1743,7 @@ plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo)
     if (!_OSKextReadCache(systemExtensionsFolderURLs, cacheBasename,
         kernelArchInfo, _kOSKextCacheFormatCFXML, /* parseXML? */ false,
         /* valuesOut*/ NULL)) {
-        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
-                               SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
-                               "kext property values cache out of date");
+        
         goto finish;
     }
 
@@ -1775,23 +1757,21 @@ finish:
 Boolean
 check_kext_boot_cache_file(
     struct bootCaches * caches,
-    const char *cache_path,
-    const char *kernel_path,
-    const char *immutable_path)
-{
+    const char * cache_path,
+    const char * kernel_path)
+{   
     Boolean      needsrebuild                       = false;
     char         fullPath[PATH_MAX]                 = "";
-    char         latestPath[PATH_MAX]               = "";
     struct stat  statbuffer;
     time_t       validModtime                       = 0;
-    time_t       prelinkedkernelModtime             = 0;
+    time_t       kernelcacheModtime                 = 0;
 
-   /* Do we have a cache file (mkext or prelinkedkernel)?
+   /* Do we have a cache file (mkext or kernelcache)?
     * Note: cache_path is a pointer field, not a static array.
     */
     if (cache_path == NULL)
         goto finish;
-
+    
    /* If so, check the mod time of the cache file vs. the extensions folder.
     */
     // we support multiple extensions directories, use latest mod time
@@ -1813,7 +1793,6 @@ check_kext_boot_cache_file(
 #endif
             if (statbuffer.st_mtime + 1 > validModtime) {
                validModtime = statbuffer.st_mtime + 1;
-               pathcpy(latestPath, fullPath);
             }
         }
         else {
@@ -1825,7 +1804,7 @@ check_kext_boot_cache_file(
     }
 
    /* Check the mod time of the appropriate kernel too, if applicable.
-    * A kernel path in bootcaches.plist means we should have a prelinkedkernel.
+    * A kernel path in bootcaches.plist means we should have a kernelcache.
     * Note: kernel_path is a static array, not a pointer field.
     */
     if (kernel_path[0]) {
@@ -1852,7 +1831,6 @@ check_kext_boot_cache_file(
          */
         if (statbuffer.st_mtime > validModtime) {
             validModtime = statbuffer.st_mtime + 1;
-            pathcpy(latestPath, fullPath);
         }
     }
 
@@ -1870,41 +1848,9 @@ check_kext_boot_cache_file(
                       CFSTR("%s - %ld <- mod time of %s "),
                       __func__, statbuffer.st_mtime, fullPath);
 #endif
-
-    prelinkedkernelModtime = statbuffer.st_mtime;
-    needsrebuild = (prelinkedkernelModtime != validModtime);
-
-    if (needsrebuild) {
-        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
-                               SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
-                               "prelinked kernel out of date due to: %s", latestPath);
-        goto finish;
-    }
-
-    if (immutable_path && immutable_path[0]) {
-        /*
-         * if we're being asked to rebuild the immutable kernel, check to see if
-         * it's last modtime is up to date
-         */
-        pathcpy(fullPath, caches->root);
-        removeTrailingSlashes(fullPath);
-        pathcat(fullPath, immutable_path);
-
-        // if the stat fails, the immutable kernel doesn't exist (and thus needs rebuilding)
-        needsrebuild = true;
-        if (stat(fullPath, &statbuffer) == -1) {
-            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
-                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
-                                   "immutable kernel doesn't exist");
-            goto finish;
-        }
-        needsrebuild = ((time_t)statbuffer.st_mtime != validModtime);
-        if (needsrebuild) {
-            os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE,
-                                   SIGNPOST_EVENT_BOOTCACHE_UPDATE_REASON,
-                                   "immutable kernel out of date due to: %s", latestPath);
-        }
-    }
+   
+    kernelcacheModtime = statbuffer.st_mtime;
+    needsrebuild = (kernelcacheModtime != validModtime);
 
 finish:
     return needsrebuild;
@@ -1942,8 +1888,6 @@ finish:
     return rval;
 }
 
-extern __attribute__ ((weak_import)) CFMutableDictionaryRef
-CoreStorageCopyFamilyProperties(CoreStorageFamilyRef familyRef); // 18021143
 
 /*****************************************************************************
 * CoreStorage FDE check & update routines
@@ -1952,7 +1896,7 @@ CoreStorageCopyFamilyProperties(CoreStorageFamilyRef familyRef); // 18021143
 // on success, caller is responsible for releasing econtext
 int
 copyCSFDEInfo(CFStringRef uuidStr, CFDictionaryRef *econtext,
-              time_t *timeStamp)
+               time_t *timeStamp)
 {
     int             rval = ELAST+1;
     CFDictionaryRef lvfprops = NULL;
@@ -1970,7 +1914,7 @@ copyCSFDEInfo(CFStringRef uuidStr, CFDictionaryRef *econtext,
     if (CoreStorageCopyFamilyProperties == NULL) {
         rval = ESHLIBVERS; goto finish;
     }
-    
+
     lvfprops = CoreStorageCopyFamilyProperties(uuidStr);
     if (!lvfprops) {
         rval = EFTYPE; goto finish;
@@ -1991,7 +1935,7 @@ copyCSFDEInfo(CFStringRef uuidStr, CFDictionaryRef *econtext,
             *econtext = CFRetain(ectx);
         }
         if (timeStamp) {
-            psRef = CFDictionaryGetValue(ectx, CFSTR(kCSFDELastUpdateTimeID));
+            psRef = CFDictionaryGetValue(ectx, CFSTR(kCSFDELastUpdateTime));
             if (psRef) {
                 if (CFGetTypeID(psRef) != CFNumberGetTypeID() ||
                     !CFNumberGetValue(psRef,kCFNumberSInt64Type,timeStamp)){
@@ -2025,23 +1969,14 @@ check_csfde(struct bootCaches *caches)
 {
     Boolean         needsupdate = false;
     time_t          propStamp, erStamp;
-    struct statfs   sfs;
     char            erpath[PATH_MAX];
     struct stat     ersb;
 
     if (!caches->csfde_uuid || !caches->erpropcache)
         goto finish;
 
-    if (copyCSFDEInfo(caches->csfde_uuid, NULL, &propStamp)) {
+    if (copyCSFDEInfo(caches->csfde_uuid, NULL, &propStamp))
         goto finish;
-    }
-
-    // if necessary, map the FDE timestamp into a valid HFS time
-    if ((int64_t)propStamp > HFS_TIME_END &&
-            fstatfs(caches->cachefd, &sfs) == 0 &&
-            strcmp(sfs.f_fstypename, "hfs") == 0) {
-        propStamp = propStamp % HFS_TIME_END;
-    }
 
     // get property cache file's timestamp
     pathcpy(erpath, caches->root);
@@ -2056,15 +1991,8 @@ check_csfde(struct bootCaches *caches)
         }
     }
 
-    // if we are on a unencrypted CoreStorage volume, don't update
-    if (caches->csfde_uuid && erStamp && !propStamp)
-        goto finish;
-
     // generally the timestamp advances, but != means out of date
     needsupdate = erStamp != propStamp;
-    if (needsupdate) {
-        os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, SIGNPOST_EVENT_CSFDE_NEEDS_UPDATE);
-    }
 
 finish:
     return needsupdate;
@@ -2150,14 +2078,6 @@ finish:
     return rval;
 }
 
-extern __attribute__ ((weak_import)) CFStringRef
-CoreStorageCopyPVWipeKeyUUID(const char * BSDName); // 18021143
-
-extern __attribute__ ((weak_import)) bool
-CSFDEWritePropertyCacheToFD(CFDictionaryRef context,
-                            int fd,
-                            CFStringRef wipeKeyUUID); // 18021143
-
 // NOTE: weak-linking depends on -weak-l/-weak_framemwork *and* the
 // function declaration being marked correctly in the header file!
 int
@@ -2171,7 +2091,7 @@ writeCSFDEProps(int scopefd, CFDictionaryRef ectx,
 
     // 9168337 didn't quite do it, see 10831618
     // check for required weak-linked symbol
-    if (CoreStorageCopyPVWipeKeyUUID == NULL) {
+    if (CoreStorageCopyPVWipeKeyUUID==NULL) {
         rval = ESHLIBVERS;
         LOGERRxlate("no CoreStorageCopyPVWipeKeyUUID()", NULL, rval);
         goto finish;
@@ -2197,9 +2117,9 @@ writeCSFDEProps(int scopefd, CFDictionaryRef ectx,
     if ((errnum = sdeepmkdir(scopefd, dstparent, kCacheDirMode))) {
         rval = errnum; LOGERRxlate(dstparent, NULL, rval); goto finish;
     }
-    
+
     // use modern function if available
-    if (CSFDEWritePropertyCacheToFD != NULL) {
+    if (CSFDEWritePropertyCacheToFD!=NULL) {
         // open and write to FD
         erfd = sopen(scopefd, dstpath, O_CREAT|O_RDWR, kCacheFileMode);
         if (-1 == erfd) {
@@ -2238,6 +2158,7 @@ _writeLegacyCSFDECache(struct bootCaches *caches)
     CFDictionaryRef ectx = NULL;
     char           *errmsg;
     char            erpath[PATH_MAX];
+    int             erfd = -1;
 
     errmsg = "invalid argument";
     if (!caches->csfde_uuid || !caches->erpropcache) {
@@ -2287,6 +2208,7 @@ _writeLegacyCSFDECache(struct bootCaches *caches)
     rval = 0;
 
 finish:
+    if (erfd != -1)     close (erfd);
     if (dataVolumes)    CFRelease(dataVolumes);
     if (ectx)           CFRelease(ectx);
 
@@ -2302,7 +2224,6 @@ rebuild_csfde_cache(struct bootCaches *caches)
 {
     int             errnum, rval = ELAST + 1;
     time_t          timeStamp;
-    struct statfs   sfs;
     char            erpath[PATH_MAX] = "<unknown>";
     struct timeval  times[2] = {{ 0, 0 }, { 0, 0 }};
 
@@ -2322,13 +2243,6 @@ rebuild_csfde_cache(struct bootCaches *caches)
     // otherwise, just grab the timestamp so update_boot.c knows to re-fetch
     if ((errnum = copyCSFDEInfo(caches->csfde_uuid, NULL, &timeStamp))) {
         rval = errnum; goto finish;
-    }
-
-    // if necessary, map the FDE timestamp into a valid HFS time
-    if ((int64_t)timeStamp > HFS_TIME_END &&
-            fstatfs(caches->cachefd, &sfs) == 0 &&
-            strcmp(sfs.f_fstypename, "hfs") == 0) {
-        timeStamp = timeStamp % HFS_TIME_END;
     }
     times[0].tv_sec = (__darwin_time_t)timeStamp;
     times[1].tv_sec = (__darwin_time_t)timeStamp;    // mdworker -> atime
@@ -2521,10 +2435,6 @@ finish:
     return;
 }
 
-extern __attribute__ ((weak_import)) CFArrayRef
-EFILoginCopyInterfaceGraphics(CFArrayRef localizationsArray,
-                              CFStringRef targetPartitionPath); // 18021143
-
 // ahh, ye olde SysLang.h :]
 // #define GLOBALPREFSFILE "/Library/Preferences/.GlobalPreferences.plist"
 #define LANGSKEY    CFSTR("AppleLanguages")   // key in .GlobalPreferences
@@ -2543,7 +2453,7 @@ _writeEFILoginResources(struct bootCaches *caches,
 
     CFRange allEntries;
     struct writeRsrcCtx applyCtx = { caches, locCacheDir, &result };
-    
+
     // can't operate without EFILogin.framework function
     // (XX as of Zin12A190, this function is not properly decorated ...)
     if (EFILoginCopyInterfaceGraphics == NULL) {
@@ -2609,26 +2519,12 @@ rebuild_loccache(struct bootCaches *caches)
     time_t      validModTime = 0;
     int         fd = -1;
     struct timeval times[2];
-    struct statfs  fsbuf;
-
+    
     // prefsb.st_size = 0;  // Analyzer doesn't check get_locres_info(&prefsb)
     bzero(&prefsb, sizeof(prefsb)); // and doesn't know bzero sets st_size = 0
     if ((errnum = get_locres_info(caches, locRsrcDir, prefPath, &prefsb,
                                   locCacheDir, &validModTime))) {
         result = errnum; goto finish;   // error logged by function
-    }
-
-    errnum = fstatfs(caches->cachefd, &fsbuf);
-    if (errnum < 0) {
-        result = errno; LOGERRxlate(locCacheDir, NULL, result);
-        goto finish;
-    }
-    if (fsbuf.f_flags & MNT_NOSUID) {
-        result = errnum = 0;
-        OSKextLog(NULL, kOSKextLogWarningLevel,
-                  "Warning: not updating EFI login resources for nosuid '%s'",
-                  caches->root);
-        goto finish;
     }
 
     // empty out locCacheDir ...
@@ -2646,8 +2542,7 @@ rebuild_loccache(struct bootCaches *caches)
     if (errnum) {
         (void)sdeepunlink(caches->cachefd, locCacheDir);
         result = errnum;
-        OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogFileAccessFlag,
-                  "Warning: _writeEFILoginResources failed");
+        LOGERRxlate("_writeEFILoginResources", NULL, result);
         goto finish;
     }
 
@@ -2854,6 +2749,8 @@ static void removeTrailingSlashes(char * path)
     return;
 }
 
+
+
 /******************************************************************************
  * updateMount() remounts the volume with the requested flags!
  *****************************************************************************/
@@ -2936,7 +2833,7 @@ launch_rebuild_all(char * rootPath, Boolean force, Boolean wait)
     if (!kcargs)    goto finish;
 
     kcargs[argi++] = "/usr/sbin/kextcache";
-    // fork_program(wait=false) decreases I/O priority while spawning
+    // fork_program(wait=false) also sets IOPOL_THROTTLE while spawning
     kcargs[argi++] = "-F";      // lower priority within kextcache
     if (force) {
         kcargs[argi++] = "-f";
@@ -2951,7 +2848,6 @@ launch_rebuild_all(char * rootPath, Boolean force, Boolean wait)
     * the pid of the forked process if >0.
     */
     rval = fork_program(kcargs[0], kcargs, wait);
-    os_signpost_event_emit(get_signpost_log(), OS_SIGNPOST_ID_EXCLUSIVE, SIGNPOST_EVENT_FORK_KEXTCACHE, "%s", rootPath);
 
 finish:
     if (kcargs)     free(kcargs);

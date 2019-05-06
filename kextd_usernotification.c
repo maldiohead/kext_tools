@@ -128,15 +128,15 @@ static void kextd_raise_unsignedkext_notification(
 #endif
 
 static void kextd_raise_excludedkext_notification(
-                                                  CFTypeRef alertHeader,
-                                                  CFTypeRef alertMessageArray );
-static int validateKextsAlertDict( CFDictionaryRef theDict );
+                                                  CFStringRef alertHeader,
+                                                  CFArrayRef  alertMessageArray );
 
 
 /*******************************************************************************
 *******************************************************************************/
 ExitStatus startMonitoringConsoleUser(
-    KextdArgs    * toolArgs)
+    KextdArgs    * toolArgs,
+    unsigned int * sourcePriority)
 {
     ExitStatus         result                 = EX_OSERR;
     CFStringRef        consoleUserName        = NULL;  // must release
@@ -195,7 +195,7 @@ ExitStatus startMonitoringConsoleUser(
     sourceContext.version = 0;
     sourceContext.perform = _checkNotificationQueue;
     sNotificationQueueRunLoopSource = CFRunLoopSourceCreate(kCFAllocatorDefault,
-                                        0, &sourceContext);
+        (*sourcePriority)++, &sourceContext);
     if (!sNotificationQueueRunLoopSource) {
        OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
            "Failed to create alert run loop source.");
@@ -443,13 +443,13 @@ void _checkNotificationQueue(void * info __unused)
     CFMutableArrayRef invalidSigAlertMessageArray   = NULL;  // must release
     CFMutableArrayRef unsignedKextAlertMessageArray = NULL;  // must release
     CFMutableArrayRef excludedAlertMessageArray     = NULL;  // must release
-    CFMutableArrayRef excludedAlertHeaderArray      = NULL;  // must release
+    CFMutableStringRef excludedAlertHeader          = NULL;  // must release
     CFIndex     count, i;
 
     if (sConsoleUser == (uid_t)-1) {
         goto finish;
     }
-
+    
     /* handle alerts for kexts that do not have the proper privs set
      */
     if (CFArrayGetCount(sPendedNonsecureKextPaths)  &&
@@ -661,15 +661,12 @@ void _checkNotificationQueue(void * info __unused)
         if (excludedAlertMessageArray == NULL) {
             goto finish;
         }
-        excludedAlertHeaderArray =
-        CFArrayCreateMutable(kCFAllocatorDefault,
-                             0,
-                             &kCFTypeArrayCallBacks);
-        if (excludedAlertHeaderArray == NULL) {
+        excludedAlertHeader = CFStringCreateMutable(kCFAllocatorDefault, 0);
+        if (excludedAlertHeader == NULL) {
             goto finish;
         }
         if (count > 1) {
-            CFArrayAppendValue(excludedAlertHeaderArray,
+            CFStringAppend(excludedAlertHeader,
                            CFSTR("Some system extensions are not compatible with this version of OS X and can’t be used:"));
             for (i = 0; i < count; i ++) {
                 kextPath = (CFStringRef) CFArrayGetValueAtIndex(
@@ -715,7 +712,7 @@ void _checkNotificationQueue(void * info __unused)
             if (kextPath == NULL) {
                 goto finish;
             }
-            CFArrayAppendValue(excludedAlertHeaderArray,
+            CFStringAppend(excludedAlertHeader,
                            CFSTR("The system extension \""));
             CFRange             myRange;
             myRange = CFStringFind(kextPath, CFSTR("/"), kCFCompareBackwards);
@@ -728,29 +725,29 @@ void _checkNotificationQueue(void * info __unused)
                                                        kextPath,
                                                        myRange);
                 if (myString) {
-                    CFArrayAppendValue(excludedAlertHeaderArray,
+                    CFStringAppend(excludedAlertHeader,
                                    myString);
                    SAFE_RELEASE(myString);
                 }
                 else {
                     // fall back to full path
-                    CFArrayAppendValue(excludedAlertHeaderArray,
+                    CFStringAppend(excludedAlertHeader,
                                    kextPath);
                 }
             }
             else {
                 // fall back to full path
-                CFArrayAppendValue(excludedAlertHeaderArray,
+                CFStringAppend(excludedAlertHeader,
                                kextPath);
             }
-            CFArrayAppendValue(excludedAlertHeaderArray,
+            CFStringAppend(excludedAlertHeader,
                            CFSTR("\" is not compatible with this version of OS X and can’t be used."));
         }
         CFArrayAppendValue(excludedAlertMessageArray,
                            CFSTR("Please contact the developer for updated software."));
         
         CFArrayRemoveAllValues(sPendedExcludedKextPaths);
-        kextd_raise_excludedkext_notification(excludedAlertHeaderArray,
+        kextd_raise_excludedkext_notification(excludedAlertHeader,
                                               excludedAlertMessageArray);
     }
 #endif // <rdar://problem/12811081>
@@ -762,7 +759,7 @@ finish:
     SAFE_RELEASE(revokedCertAlertMessageArray);
     SAFE_RELEASE(invalidSigAlertMessageArray);
     SAFE_RELEASE(unsignedKextAlertMessageArray);
-    SAFE_RELEASE(excludedAlertHeaderArray);
+    SAFE_RELEASE(excludedAlertHeader);
     return;
 }
 
@@ -948,8 +945,8 @@ void sendExcludedKextNotification(void)
 /*******************************************************************************
  *******************************************************************************/
 static CFMutableDictionaryRef createAlertDict(
-                                              CFTypeRef alertHeader,
-                                              CFTypeRef alertMessageArray )
+                                              CFStringRef alertHeader,
+                                              CFArrayRef  alertMessageArray )
 {
     CFMutableDictionaryRef alertDict               = NULL;  // do not release
     CFURLRef               iokitFrameworkBundleURL = NULL;  // must release
@@ -1244,8 +1241,8 @@ finish:
 /*******************************************************************************
  *******************************************************************************/
 static void kextd_raise_excludedkext_notification(
-                                                  CFTypeRef alertHeader,
-                                                  CFTypeRef alertMessageArray )
+                                                  CFStringRef alertHeader,
+                                                  CFArrayRef  alertMessageArray )
 {
     CFMutableDictionaryRef alertDict               = NULL;  // must release
     SInt32                 userNotificationError   = 0;
@@ -1515,6 +1512,7 @@ static void revealInFinder(CFArrayRef theArray)
 
 void writeKextAlertPlist( CFDictionaryRef theDict, int theAlertType )
 {
+    CFStringRef             myVolRoot       = NULL;  // do NOT release
     CFArrayRef              myKextArray;             // do NOT release
     CFURLRef                myURL           = NULL;  // must release
     CFStringRef             myPath          = NULL;  // must release
@@ -1525,13 +1523,23 @@ void writeKextAlertPlist( CFDictionaryRef theDict, int theAlertType )
     Boolean                 fileExists;
     Boolean                 closeReadStream     = false;
     Boolean                 closeWriteStream    = false;
-  
-    if (validateKextsAlertDict(theDict) != 0) {
+    
+    if (theDict == NULL) {
+        goto finish;
+    }
+    myKextArray = (CFArrayRef)
+        CFDictionaryGetValue(theDict, CFSTR("KextInfoArrayKey"));
+    if (myKextArray == NULL || CFArrayGetCount(myKextArray) < 1) {
         goto finish;
     }
     
-    myKextArray = (CFArrayRef) CFDictionaryGetValue(theDict, CFSTR("KextInfoArrayKey"));
-    myPath = createPathFromAlertType(NULL, theAlertType);
+    /* note for the kextcache case we could target a volume other than the boot
+     * volume.  In that case we need to add the "/Volumes/XXXvol/"
+     * to the path.
+     */
+    myVolRoot = (CFStringRef) CFDictionaryGetValue( theDict,
+                                                    CFSTR("VolRootKey"));
+    myPath = createPathFromAlertType(myVolRoot, theAlertType);
     if (myPath == NULL) {
         OSKextLogMemError();
         goto finish;
@@ -1546,7 +1554,7 @@ void writeKextAlertPlist( CFDictionaryRef theDict, int theAlertType )
         goto finish;
     }
     fileExists = CFURLResourceIsReachable(myURL, NULL);
-   
+    
     /* grab existing data and append to it */
     if (fileExists) {
         readStream = CFReadStreamCreateWithFile(kCFAllocatorDefault, myURL);
@@ -1672,7 +1680,6 @@ finish:
     return;
 }
 
-
 /*******************************************************************************
  * sendRevokedCertAlert() - build an array of kexts with revoked certs then
  * send to put up an alert.
@@ -1683,10 +1690,9 @@ void sendRevokedCertAlert( CFDictionaryRef theDict )
     CFArrayRef  myKextArray;             // do NOT release
     CFIndex     count, i;
     
-    if (validateKextsAlertDict(theDict) != 0) {
+    if (theDict == NULL) {
         goto finish;
     }
-    
     myKextArray = (CFArrayRef)
     CFDictionaryGetValue(theDict, CFSTR("KextInfoArrayKey"));
     if (myKextArray == NULL ||
@@ -1744,10 +1750,13 @@ static Boolean sendKextAlertNotifications(CFMutableArrayRef *theSentAlertsArrayP
         CFStringRef             myBundleID;             // do NOT release
         CFStringRef             myMappingKey = NULL;    // must release
         
-        myDict = (CFDictionaryRef) CFArrayGetValueAtIndex(theKextsArray, i);
+        myDict = (CFDictionaryRef)
+        CFArrayGetValueAtIndex(theKextsArray, i);
         if (myDict == NULL)   continue;
         
-        myBundleID = (CFStringRef) CFDictionaryGetValue(myDict, kCFBundleIdentifierKey);
+        myBundleID = (CFStringRef)
+        CFDictionaryGetValue(myDict, kCFBundleIdentifierKey);
+        
         myMappingKey = createBundleMappingKey(myBundleID);
         
         if (theSentAlertsArrayPtr) {
@@ -1869,85 +1878,26 @@ cat loadedkextmt.plist
  </dict>
  *
  */
- #define OBSOLETE_LOADED_KEXT_MT_ALERT_FULL_PATH \
- _kOSKextCachesRootFolder "/" \
- _kOSKextStartupCachesSubfolder "/" \
- "loadedkextmt.plist"
-
 #define LOADED_KEXT_MT_ALERT_FULL_PATH \
-"/var/db/loadedkextmt.plist"
+_kOSKextCachesRootFolder "/" \
+_kOSKextStartupCachesSubfolder "/" \
+"loadedkextmt.plist"
 
-static Boolean
-MergeRequests(CFMutableDictionaryRef dict, CFStringRef key, CFArrayRef requests)
-{
-    CFMutableArrayRef existingRequests;
-    Boolean           didAlter = false;
-    CFIndex           count, i;
-
-    if (!requests) {
-        return (false);
-    }
-    existingRequests = (CFMutableArrayRef) CFDictionaryGetValue(dict, key);
-    if (existingRequests == NULL) {
-        didAlter = true;
-        CFDictionarySetValue(dict, key, requests);
-    } else {
-        count = CFArrayGetCount(requests);
-        for (i = 0; i < count; i++) {
-            CFTypeRef value = CFArrayGetValueAtIndex(requests, i);
-            if (!CFArrayContainsValue(existingRequests, RANGE_ALL(existingRequests), value)) {
-                didAlter = true;
-                CFArrayAppendValue(existingRequests, value);
-            }
-        }
-    }
-    return (didAlter);
-}
-
-void writeKextLoadPlist( CFArrayRef kextArray )
+void writeKextLoadPlist( CFArrayRef theArray )
 {
     CFURLRef                myURL           = NULL;  // must release
     CFReadStreamRef         readStream      = NULL;  // must release
     CFWriteStreamRef        writeStream     = NULL;  // must release
-    CFMutableDictionaryRef  alertPlist      = NULL;  // must release
+    CFDictionaryRef         alertPlist      = NULL;  // must release
     CFMutableDictionaryRef  alertDict       = NULL;  // must release
-    CFArrayRef              loadRequests    = NULL;  // must release
-    CFMutableArrayRef       userRequests    = NULL;  // must release
-    CFTypeRef               bundleID;
     Boolean                 fileExists;
     Boolean                 closeReadStream     = false;
     Boolean                 closeWriteStream    = false;
-    Boolean                 didAlter            = false;
-    CFIndex                 count, i;
-
-    if (kextArray == NULL || CFArrayGetCount(kextArray) < 1) {
+    
+    if (theArray == NULL || CFArrayGetCount(theArray) < 1) {
         goto finish;
     }
-    loadRequests = OSKextCopyAllRequestedIdentifiers();
-
-    userRequests = CFArrayCreateMutable(kCFAllocatorDefault,
-                                        0,
-                                        &kCFTypeArrayCallBacks);
-    if (userRequests == NULL) {
-        goto finish;
-    }
-
-    count = CFArrayGetCount(kextArray);
-    for (i = 0; i < count; i++) {
-        // the information for each kext is stored as a dictionary
-        CFMutableDictionaryRef kextDict = (CFMutableDictionaryRef) CFArrayGetValueAtIndex(kextArray, i);
-        if (CFDictionaryGetValue(kextDict, CFSTR(kMessageTracerUserLoadKey))) {
-            CFDictionaryRemoveValue(kextDict, CFSTR(kMessageTracerUserLoadKey));
-            bundleID = CFDictionaryGetValue(kextDict, CFSTR(kMessageTracerBundleIDKey));
-            if (!bundleID) {
-                continue;
-            }
-            CFArrayAppendValue(userRequests, bundleID);
-        }
-    }
-
-    unlink(OBSOLETE_LOADED_KEXT_MT_ALERT_FULL_PATH);
-
+        
     myURL = CFURLCreateFromFileSystemRepresentation(
                                     kCFAllocatorDefault,
                                     (UInt8 *) LOADED_KEXT_MT_ALERT_FULL_PATH,
@@ -1959,7 +1909,7 @@ void writeKextLoadPlist( CFArrayRef kextArray )
     }
     fileExists = CFURLResourceIsReachable(myURL, NULL);
     
-    /* grab existing data */
+    /* grab existing data and append to it */
     if (fileExists) {
         readStream = CFReadStreamCreateWithFile(kCFAllocatorDefault, myURL);
         if (readStream == NULL) {
@@ -1974,7 +1924,7 @@ void writeKextLoadPlist( CFArrayRef kextArray )
         }
         
         /* read in the existing contents of plist */
-        alertPlist = (CFMutableDictionaryRef) CFPropertyListCreateWithStream(
+        alertPlist = CFPropertyListCreateWithStream(
                                                     kCFAllocatorDefault,
                                                     readStream,
                                                     0,
@@ -1984,13 +1934,7 @@ void writeKextLoadPlist( CFArrayRef kextArray )
             OSKextLogMemError();
             goto finish;
         }
-
-        /* merge in any new load requests */
-        didAlter |= MergeRequests(alertPlist, CFSTR("All requests"), loadRequests);
-        didAlter |= MergeRequests(alertPlist, CFSTR("User requests"), userRequests);
-
-        /* add any kext paths that are not already known */
-
+        
         CFMutableArrayRef sentArray = NULL;  // do not release
         sentArray = (CFMutableArrayRef)
             CFDictionaryGetValue(alertPlist, CFSTR("Alerts sent"));
@@ -2000,18 +1944,23 @@ void writeKextLoadPlist( CFArrayRef kextArray )
             goto finish;
         }
         
-        count = CFArrayGetCount(kextArray);
+        /* add any kext paths that are not already known */
+        CFIndex     count, i;
+        Boolean     didAppend = false;
+        
+        count = CFArrayGetCount(theArray);
         for (i = 0; i < count; i++) {
             // the information for each kext is stored as a dictionary
-            CFDictionaryRef kextDict = CFArrayGetValueAtIndex(kextArray, i);
+            CFDictionaryRef kextDict = CFArrayGetValueAtIndex(theArray, i);
+             
             if (!CFArrayContainsValue(sentArray, RANGE_ALL(sentArray), kextDict)) {
-                didAlter = true;
+                didAppend = true;
                 CFArrayAppendValue(sentArray, kextDict);
             }
         }
-
+        
         /* now replace previous plist with our updated one */
-        if (didAlter) {
+        if (didAppend) {
             writeStream = CFWriteStreamCreateWithFile(kCFAllocatorDefault, myURL);
             if (writeStream == NULL) {
                 OSKextLogMemError();
@@ -2042,15 +1991,9 @@ void writeKextLoadPlist( CFArrayRef kextArray )
         }
         
         /* add our array to the dictionary */
-        CFDictionarySetValue(alertDict, CFSTR("Alerts sent"), kextArray);
-        if (loadRequests) {
-            CFDictionarySetValue(alertDict, CFSTR("All requests"), loadRequests);
-        }
-        if (userRequests) {
-            CFDictionarySetValue(alertDict, CFSTR("User requests"), userRequests);
-        }
-
-        alertPlist = (CFMutableDictionaryRef) CFPropertyListCreateDeepCopy(
+        CFDictionarySetValue(alertDict, CFSTR("Alerts sent"), theArray); 
+        
+        alertPlist = CFPropertyListCreateDeepCopy(
                                                   kCFAllocatorDefault,
                                                   alertDict,
                                                   kCFPropertyListMutableContainersAndLeaves );
@@ -2086,9 +2029,7 @@ finish:
     SAFE_RELEASE(writeStream);
     SAFE_RELEASE(alertPlist);
     SAFE_RELEASE(alertDict);
-    SAFE_RELEASE(loadRequests);
-    SAFE_RELEASE(userRequests);
-    SAFE_RELEASE(kextArray);
+    SAFE_RELEASE(theArray);
     
     return;
 }
@@ -2155,6 +2096,7 @@ static CFStringRef createBundleMappingKey( CFStringRef theBundleID )
 finish:
     return(myMatchKey);
 }
+
 
 /* This is the routine that controls our "alert only once" policy.  
  * theSentArray is an array of kext info dictionaries for kexts we have 
@@ -2373,108 +2315,6 @@ finish:
     return( myPath );
 }
 
-
-/*******************************************************************************
- * Do some sanity checking on this dictionary, do not trust the source.
- *******************************************************************************/
-static int validateKextsAlertDict( CFDictionaryRef theDict )
-{
-    CFArrayRef  myKextArray;            // do NOT release
-    CFIndex     count, i;
-    int         result = -1;
-    
-    if (theDict == NULL || CFGetTypeID(theDict) != CFDictionaryGetTypeID()) {
-        OSKextLogCFString(/* kext */ NULL,
-                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                          CFSTR("%s invalid dictionary type \n"),
-                          __func__);
-        goto finish;
-    }
-    
-    myKextArray = (CFArrayRef) CFDictionaryGetValue(theDict, CFSTR("KextInfoArrayKey"));
-    if (myKextArray == NULL) {
-        OSKextLogCFString(/* kext */ NULL,
-                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                          CFSTR("%s null array \n"),
-                          __func__);
-        goto finish;
-    }
-    if ( CFGetTypeID(myKextArray) != CFArrayGetTypeID() ) {
-        OSKextLogCFString(/* kext */ NULL,
-                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                          CFSTR("%s invalid array type \n"),
-                          __func__);
-        goto finish;
-    }
-    if (CFArrayGetCount(myKextArray) < 1 || CFArrayGetCount(myKextArray) > 10) {
-        OSKextLogCFString(/* kext */ NULL,
-                          kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                          CFSTR("%s invalid array count %lu \n"),
-                          __func__, CFArrayGetCount(myKextArray));
-        goto finish;
-    }
-    
-    count = CFArrayGetCount(myKextArray);
-    for (i = 0; i < count; i++) {
-        CFDictionaryRef         myDict;                 // do NOT release
-        CFStringRef             myString;               // do NOT release
-        
-        myDict = (CFDictionaryRef) CFArrayGetValueAtIndex(myKextArray, i);
-        if (myDict == NULL || CFGetTypeID(myDict) != CFDictionaryGetTypeID()) {
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                              CFSTR("%s invalid kext array dictionary \n"),
-                              __func__);
-            goto finish;
-        }
-     
-        if (CFDictionaryGetCount(myDict) > 3) {
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                              CFSTR("%s invalid dictionary count %lu \n"),
-                              __func__, CFDictionaryGetCount(myDict));
-            goto finish;
-        }
-        
-        myString = CFDictionaryGetValue(myDict, CFSTR("KextPathKey"));
-        if (myString == NULL ||
-            CFGetTypeID(myString) != CFStringGetTypeID() ||
-            CFStringGetLength(myString) > 1024) {
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                              CFSTR("%s invalid kext path value \n"),
-                              __func__);
-            goto finish;
-        }
-        
-        myString = CFDictionaryGetValue(myDict, kCFBundleIdentifierKey);
-        if (myString == NULL ||
-            CFGetTypeID(myString) != CFStringGetTypeID() ||
-            CFStringGetLength(myString) > 256) {
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                              CFSTR("%s invalid kext bundle ID value \n"),
-                              __func__);
-            goto finish;
-        }
-        
-        myString = CFDictionaryGetValue(myDict, kCFBundleVersionKey);
-        if (myString == NULL ||
-            CFGetTypeID(myString) != CFStringGetTypeID() ||
-            CFStringGetLength(myString) > 256) {
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                              CFSTR("%s invalid kext bundle version value \n"),
-                              __func__);
-            goto finish;
-        }
-        
-    } // for loop...
-    result = 0;
-    
-finish:
-    return result;
-}
 
 /*******************************************************************************
  * Installer folks tell us the best way to determine if we are doing a system

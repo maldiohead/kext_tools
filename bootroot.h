@@ -111,7 +111,7 @@ int32_t BRBLLogFunc(void *refcon, int32_t level, const char *string);
  *
  *  @discussion
  *      At minimum, ensures that a local-root primory kext cache
- *      (traditional mkext, modern prelinked kernel) is up to date and
+ *      (traditional mkext, modern kernelcache) is up to date and
  *      then -- if needed or requested -- copies all Boot!=Root
  *      files to the appropriate helper partition(s) (e.g. Apple_Boot).
  *
@@ -269,27 +269,15 @@ typedef enum {
     // bits 2-7 reserved
     kBRBlessFull    = 0x11, // FSDefault + boot-device->targetPartition
                             // (system will boot these until changed)
-    kBRBlessOnce    = 0x20, // efi-boot-next -> dev/boot.efi
+    kBRBlessOnce    = 0x20  // efi-boot-next -> dev/boot.efi
                             // (system will boot these files once)
-    kBRBlessRecovery = 0x40 // attempt to bless recovery if present,
-                            // if successful will erase old boot files
     // kBRBlessFSDefault|kBRBlessOnce will configure the filesystem(s)
     // always to boot the target (for example, from the option picker)
     // but will only set NVRAM to boot it once.
 } BRBlessStyle;
 typedef uint32_t BRCopyFilesOpts;
 #define  kBROptsNone        0x0
-// Return EX_OSFILE if boot files were not up-to-date (0 if they were).
-// There are several side effects of this flag, including skipping unnecessary
-// actions like regenerating disk labels.
-#define  kBRUExpectUpToDate  0x8
-// Do not attempt to copy or generate the FDE resources in the event the volume
-// is CSFDE.
-#define  kBROptsNoFDEResCopy 0x10
 #define  kBRAnyBootStamps   0x10000   // any bootstamps written to top level
-// Use the designated staging directory. Requires targetDir == NULL.
-// Clients using this flag are responsible for unmounting the target volume.
-#define  kBRUseStagingDir   0x20000
 OSStatus BRCopyBootFilesToDir(CFURLRef srcVol,
                               CFURLRef initialRoot,
                               CFDictionaryRef bootPrefOverrides,
@@ -298,8 +286,6 @@ OSStatus BRCopyBootFilesToDir(CFURLRef srcVol,
                               BRBlessStyle blessSpec,
                               CFStringRef pickerLabel,
                               BRCopyFilesOpts opts);
-
-#define  kBRStagingDirName    "com.apple.boot.once"
 
 /*!
  *  @function   BREraseBootFiles

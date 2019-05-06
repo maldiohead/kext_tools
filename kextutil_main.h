@@ -37,11 +37,6 @@ enum {
     // don't think we use it
     kKextutilExitUnspecified = 11,
 
-    // This publicy documented exit code (TN2459) has the same value across both
-    // tools (kextload and kextutil) and corresponds to kOSKextReturnSystemPolicy
-    // at the KextManager / OSKext API layer.
-    kKextutilExitSystemPolicy = 27,
-
     // don't actually exit with this, it's just a sentinel value
     kKextutilExitHelp        = 33,
     kKextutilExitNoStart

@@ -60,7 +60,6 @@
 #define kBCKernelcacheV1Key         CFSTR("Kernelcache v1.1")// dict
 #define kBCKernelcacheV2Key         CFSTR("Kernelcache v1.2")// dict
 #define kBCKernelcacheV3Key         CFSTR("Kernelcache v1.3")// dict
-#define kBCKernelcacheV4Key         CFSTR("Kernelcache v1.4")// dict
 #define kBCKernelPathKey            CFSTR("KernelPath")      //   m_k | kernel
 #define kBCPreferredCompressionKey  CFSTR("Preferred Compression") // "lzvn"
 #if DEV_KERNEL_SUPPORT
@@ -68,7 +67,7 @@
 #endif
 #define kBCArchsKey                 CFSTR("Archs")           //   ... i386
 #define kBCExtensionsDirKey         CFSTR("ExtensionsDir")   //   /S/L/E, /L/E
-#define kBCPathKey                  CFSTR("Path")            //   ...prelinkedkernel
+#define kBCPathKey                  CFSTR("Path")            //   ...kernelcache
 // AdditionalPaths are optional w/PreBootPaths, required w/PostBootPaths
 #define kBCAdditionalPathsKey       CFSTR("AdditionalPaths") // array
 #define kBCBootConfigKey            CFSTR("BootConfig")      // bc.plist
@@ -80,6 +79,7 @@
 #define kBCCSFDELanguagesPrefKey    CFSTR("LanguagesPref")   //   .GlobalPrefs
 #define kBCCSFDEBackgroundImageKey  CFSTR("BackgroundImage") //   desktop..png
 #define kBCCSFDELocRsrcsCacheKey    CFSTR("LocalizedResourcesCache") // EFILocs
+
 
 typedef enum {
     kMkextCRCError = -1,
@@ -127,7 +127,7 @@ struct bootCaches {
     cachedPath ofbooter;        // (we have to bless them, etc)
 
     // pointers to special watched paths (stored in arrays above)
-    cachedPath *kext_boot_cache_file;     // -> prelinkedkernel
+    cachedPath *kext_boot_cache_file;     // -> kernelcache
     cachedPath *bootconfig;     // -> .../L/Prefs/SC/com.apple.Boot.plist
     cachedPath *efidefrsrcs;    // -> usr/standalone/i386/EfiLoginUI
     cachedPath *efiloccache;    // -> ...Caches/../EFILoginLocalizations
@@ -139,7 +139,7 @@ struct bootCaches {
                                 // This will be 0 for volumes that do not support
                                 // /System/Library/Kernels/.
     int nekcp;                          // number of extraKernelCachePaths
-    cachedPath *extraKernelCachePaths;  // prelinkedkernel files with suffix, may be NULL
+    cachedPath *extraKernelCachePaths;  // kernelcache files with suffix, may be NULL
 #endif
 };
 /* use sizeof() to get it the right bounds */
@@ -201,16 +201,14 @@ int updateStamps(struct bootCaches *caches, int command);
 Boolean plistCachesNeedRebuild(const NXArchInfo * kernelArchInfo);
 Boolean check_kext_boot_cache_file(
     struct bootCaches * caches,
-    const char *cache_path,
-    const char *kernel_path,
-    const char *immutable_path);
+    const char * cache_path,
+    const char * kernel_path);
 // build the mkext; waiting for the kextcache child if instructed
 int rebuild_kext_boot_cache_file(
     struct bootCaches *caches,
+    Boolean wait,
     const char * cache_path,
-    const char * kernel_file,
-    Boolean startup_kexts_ok,
-    Boolean rebuild_immutable_kernel);
+    const char * kernel_file);
 
 // check/rebuild CSFDE caches
 Boolean check_csfde(struct bootCaches *caches);
@@ -223,6 +221,7 @@ int rebuild_loccache(struct bootCaches *caches);
 // diskarb helpers
 void _daDone(DADiskRef disk, DADissenterRef dissenter, void *ctx);
 int updateMount(mountpoint_t mount, uint32_t mntgoal);
+
 
 pid_t launch_rebuild_all(char * rootPath, Boolean force, Boolean wait);
 

@@ -29,7 +29,9 @@ int fork_program(const char * argv0, char * const argv[], Boolean wait)
     pid_t          child_pid;
     int            child_status;
     int            normal_iopolicy = getiopolicy_np(IOPOL_TYPE_DISK,
-                                                    IOPOL_SCOPE_PROCESS);
+
+                                                    
+IOPOL_SCOPE_PROCESS);
     char ** environ = *(_NSGetEnviron());
 
 #if 0 // spew program and arguments we are forking... 
@@ -64,7 +66,7 @@ int fork_program(const char * argv0, char * const argv[], Boolean wait)
 #endif
 
     if (!wait) {
-        setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_UTILITY);
+        setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE);
     }
 
     spawn_result = posix_spawn(&child_pid, argv0, /* file_actions */ NULL,

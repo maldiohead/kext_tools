@@ -14,7 +14,6 @@
 #include <mach/mach_error.h>
 
 #include <getopt.h>
-#include <os/log.h>
 #include <sysexits.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -45,16 +44,8 @@ typedef struct {
 #define __kOSKextApplePrefix        CFSTR("com.apple.")
 
 #define kAppleInternalPath      "/AppleInternal"
-#define kDefaultDevKernelPath   "/System/Library/Kernels/kernel.development"
-#define kDefaultDevKernelSuffix ".development"
-
-#define kImmutableKernelFileName "immutablekernel"
-
-// 17 leap days from 1904 to 1970, inclusive
-#define UNIX_MAC_TIME_DELTA ((1970-1904)*365*86400 + 17*86400)
-#define HFS_TIME_END (((1LL<<32) - 1) - UNIX_MAC_TIME_DELTA)
-// date -r $((0xffffffff - 2082844800))
-// Mon Feb  6 06:28:15 UTC 2040
+#define kDefaultKernelDevPath   "/System/Library/Kernels/kernel.development"
+#define kDefaultKernelSuffix    ".development"
 
 #pragma mark Macros
 /*********************************************************************
@@ -79,50 +70,6 @@ typedef struct {
 #define RANGE_ALL(a)   CFRangeMake(0, CFArrayGetCount(a))
 
 #define COMPILE_TIME_ASSERT(pred)   switch(0){case 0:case pred:;}
-
-/*
- * Macros to support PATHCPY/PATHCAT
- *
- * _ERROR_LABEL() -> finish
- * _ERROR_LABEL(somelabel) -> somelabel
- */
-#define _GET_ERROR_LABEL(_0,_label,...) _label
-#define _ERROR_LABEL(...) _GET_ERROR_LABEL(_0, ## __VA_ARGS__, finish)
-
-/*
- * Wrap up strlcpy and strlcat for paths.
- * By default, these macros assume you are copying into a buffer of
- * size PATH_MAX, and that a label named "finish" is where you would
- * like to jump on error. Also, we seed errno since strlXXX routines
- * do not set it. This will make downstream error messages more
- * meaningful (since we're often logging the errno value and message).
- * COMPILE_TIME_ASSERT() on PATHCPY breaks schdirparent().
- *
- * If a third argument is passed to this macro, it's used as the name
- * of the error label.
- */
-#define PATHCPY(dst,src,...) \
-        do { \
-            /* COMPILE_TIME_ASSERT(sizeof(dst) == PATH_MAX); */ \
-            bool useErrno = (errno == 0); \
-            if (useErrno)       errno = ENAMETOOLONG; \
-            if (strlcpy(dst, src, PATH_MAX) >= PATH_MAX) { \
-                goto _ERROR_LABEL(__VA_ARGS__); \
-            } \
-            if (useErrno)       errno = 0; \
-        } while(0)
-
-#define PATHCAT(dst,src,...) \
-        do { \
-            COMPILE_TIME_ASSERT(sizeof(dst) == PATH_MAX); \
-            bool useErrno = (errno == 0); \
-            if (useErrno)       errno = ENAMETOOLONG; \
-            if (strlcat(dst, src, PATH_MAX) >= PATH_MAX) { \
-                goto _ERROR_LABEL(__VA_ARGS__); \
-            } \
-            if (useErrno)       errno = 0; \
-        } while(0)
-
 
 /*********************************************************************
 *********************************************************************/
@@ -149,7 +96,6 @@ typedef struct {
 #define kOptNameHelp                    "help"
 #define kOptNameQuiet                   "quiet"
 #define kOptNameVerbose                 "verbose"
-#define kOptNameLayoutMap               "layout"
 
 #define kOptNameLongindexHack           "________"
 
@@ -165,7 +111,6 @@ typedef struct {
 #define kOptHelp             'h'
 #define kOptQuiet            'q'
 #define kOptVerbose          'v'
-#define kOptLayoutMap        'l'
 
 // Long opts always defined in each program to avoid # collisions
 
@@ -199,9 +144,7 @@ void beQuiet(void);
 
 FILE *  g_log_stream;
 // tool_openlog(), tool_log() copied to bootroot.h for libBootRoot clients
-void tool_initlog();
 void tool_openlog(const char * name);
-os_log_t get_signpost_log(void);
 void tool_log(
     OSKextRef aKext,
     OSKextLogSpec logSpec,
@@ -254,10 +197,6 @@ ExitStatus getFilePathTimes(
                             const char        * filePath,
                             struct timeval      cacheFileTimes[2]);
 
-ExitStatus getFileDescriptorTimes(
-                                   int the_fd,
-                                   struct timeval   cacheFileTimes[2]);
-
 ExitStatus getParentPathTimes(
                               const char        * thePath,
                               struct timeval      cacheFileTimes[2] );
@@ -276,27 +215,6 @@ void addKextToAlertDict(
 
 char * getPathExtension(const char * pathPtr);
 
-int getFileDevAndInoWith_fd(int the_fd, dev_t * the_dev_t, ino_t * the_ino_t);
-int getFileDevAndIno(const char * thePath, dev_t * the_dev_t, ino_t * the_ino_t);
-Boolean isSameFileDevAndIno(int the_fd,
-                            const char * thePath,
-                            bool followSymlinks,
-                            dev_t the_dev_t,
-                            ino_t the_ino_t);
-Boolean isSameFileDevAndInoWith_fd(int      the_fd,
-                                   dev_t    the_dev_t,
-                                   ino_t    the_ino_t);
-
-Boolean createRawBytesFromHexString(char *bytePtr,
-                                    size_t byteLen,
-                                    const char *hexPtr,
-                                    size_t hexLen);
-
-Boolean createHexStringFromRawBytes(char *hexPtr,
-                                    size_t hexLen,
-                                    const char *bytePtr,
-                                    size_t byteLen);
-
 // bootcaches.plist helpers
 CFDictionaryRef copyBootCachesDictForURL(CFURLRef theVolRootURL);
 Boolean getKernelPathForURL(
@@ -308,9 +226,6 @@ Boolean getKernelPathForURL(
 Boolean useDevelopmentKernel(const char * theKernelPath);
 Boolean isDebugSetInBootargs(void);
 
-// path translation from prelinkedkernel to immutablekernel
-bool translatePrelinkedToImmutablePath(const char *prelinked_path,
-                                       char *imk_path, size_t imk_len);
 
 /*********************************************************************
 * From IOKitUser/kext.subproj/OSKext.c.
@@ -318,5 +233,4 @@ bool translatePrelinkedToImmutablePath(const char *prelinked_path,
 
 extern char * createUTF8CStringForCFString(CFStringRef aString);
 
-void setVariantSuffix(void);
 #endif /* _KEXT_TOOLS_UTIL_H */

@@ -39,8 +39,6 @@
 #include "kextd_personalities.h"
 #include "kextd_usernotification.h"
 #include "kextd_globals.h"
-#include "signposts.h"
-#include "staging.h"
 
 static OSReturn sendCachedPersonalitiesToKernel(Boolean resetFlag);
 
@@ -51,12 +49,10 @@ OSReturn sendSystemKextPersonalitiesToKernel(
     Boolean    resetFlag)
 {
     OSReturn          result         = kOSReturnSuccess;  // optimistic
-    CFArrayRef        personalities  = NULL;    // must release
-    CFMutableArrayRef authenticKexts = NULL;    // must release
-    CFMutableArrayRef nonsecureKexts = NULL;    // must release
-    os_signpost_id_t  spid           = 0;
+    CFArrayRef        personalities  = NULL;  // must release
+    CFMutableArrayRef authenticKexts = NULL; // must release
     CFIndex           count, i;
-
+    
    /* Note that we are going to finish on success here!
     * If we sent personalities we are done.
     * sendCachedPersonalitiesToKernel() logs a msg on failure.
@@ -66,9 +62,6 @@ OSReturn sendSystemKextPersonalitiesToKernel(
         goto finish;
     }
 
-    spid = generate_signpost_id();
-    os_signpost_interval_begin(get_signpost_log(), spid, SIGNPOST_KEXTD_PERSONALITY_SCRAPE);
-
    /* If we didn't send from cache, send from the kexts. This will cause
     * lots of I/O.
     */
@@ -77,37 +70,17 @@ OSReturn sendSystemKextPersonalitiesToKernel(
         goto finish;
     }
 
-    if (!createCFMutableArray(&nonsecureKexts, &kCFTypeArrayCallBacks)) {
-        OSKextLogMemError();
-        goto finish;
-    }
+   /* Check all the kexts to see if we need to raise alerts
+    * about improperly-installed extensions.
+    */
+    recordNonsecureKexts(kexts);
 
     count = CFArrayGetCount(kexts);
     for (i = 0; i < count; i++) {
         OSKextRef aKext = (OSKextRef)CFArrayGetValueAtIndex(kexts, i);
-        /* Since only authenticated personalities can be sent to the kernel, and authentication
-         * requires them being in a secure location, staging must happen here if necessary.
-         * Generally the kextcache rebuild has already taken care of caching these into the
-         * personality cache, but we can't depend on the cache.
-         */
-        OSKextRef stagedKext = createStagedKext(aKext);
-        if (!stagedKext) {
-            CFArrayAppendValue(nonsecureKexts, aKext);
-            OSKextLogCFString(/* kext */ NULL,
-                              kOSKextLogErrorLevel | kOSKextLogIPCFlag,
-                              CFSTR("Unable to stage kext for iokit matching: %@"),
-                              aKext);
-            continue;
+        if (OSKextIsAuthentic(aKext)) {
+            CFArrayAppendValue(authenticKexts, aKext);
         }
-
-        if (OSKextIsAuthentic(stagedKext)) {
-            CFArrayAppendValue(authenticKexts, stagedKext);
-        }
-        SAFE_RELEASE(stagedKext);
-    }
-
-    if (CFArrayGetCount(nonsecureKexts) > 0) {
-        recordNonsecureKexts(nonsecureKexts);
     }
 
     result = OSKextSendPersonalitiesOfKextsToKernel(authenticKexts,
@@ -127,9 +100,6 @@ OSReturn sendSystemKextPersonalitiesToKernel(
             _kOSKextCacheFormatIOXML, personalities);
 
 finish:
-    if (spid) {
-        os_signpost_interval_end(get_signpost_log(), spid, SIGNPOST_KEXTD_PERSONALITY_SCRAPE);
-    }
     if (result != kOSReturnSuccess) {
         OSKextLog(/* kext */ NULL,
             kOSKextLogErrorLevel | kOSKextLogIPCFlag,
@@ -141,7 +111,6 @@ finish:
             "Sent %ld kext personalities to the IOCatalogue.",
             CFArrayGetCount(personalities));
     }
-    SAFE_RELEASE(nonsecureKexts);
     SAFE_RELEASE(personalities);
     SAFE_RELEASE(authenticKexts);
     return result;

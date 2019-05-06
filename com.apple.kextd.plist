@@ -12,11 +12,9 @@
 	</array>
 	<key>KeepAlive</key>
 	<dict>
-		<key>Crashed</key>
-		<true/>
+		<key>SuccessfulExit</key>
+		<false/>
 	</dict>
-	<key>RunAtLoad</key>
-	<true/>
 	<key>MachServices</key>
 	<dict>
 		<key>com.apple.KernelExtensionServer</key>

@@ -26,28 +26,14 @@
 #include <IOKit/IOKitLib.h>
 #include <Security/Security.h>
 #include <sys/sysctl.h>
-#include <sys/csr.h>
-#include <syslog.h>
 #include <servers/bootstrap.h>
 #include <IOKit/kext/kextmanager_types.h>
 
-#include "kext_tools_util.h"
 #include "security.h"
-#include "staging.h"
-#include "syspolicy.h"
+#include "kext_tools_util.h"
 
-#if HAVE_DANGERZONE
-#include <dz/dz.h>
 
-// Mark functions as weak linked so we can check if they exist without the compiler
-// optimizing out the code.
-extern void __attribute__((weak_import))
-dz_notify_kext_load_v2(dz_kext_load_t type, const char *kextpath,
-        dz_kext_load_flags_t flags, bool allowed);
-
-extern void __attribute__((weak_import))
-dz_notify_kextcache_update_v2(const char *kextpath, bool allowed);
-#endif // HAVE_DANGERZONE
+#define USE_OLD_EXCEPTION_LIST 1
 
 /*******************************************************************************
  * Helper functions
@@ -55,103 +41,20 @@ dz_notify_kextcache_update_v2(const char *kextpath, bool allowed);
 static OSStatus     checkRootCertificateIsApple(OSKextRef aKext);
 static CFStringRef  copyCDHash(SecStaticCodeRef code);
 static CFStringRef  copyIssuerCN(SecCertificateRef certificate);
+static void         copySigningInfo(CFURLRef kextURL,
+                                    CFStringRef* cdhash,
+                                    CFStringRef* teamId,
+                                    CFStringRef* subjectCN,
+                                    CFStringRef* issuerCN);
 static CFArrayRef   copySubjectCNArray(CFURLRef kextURL);
 static CFStringRef  copyTeamID(SecCertificateRef certificate);
 static CFStringRef  createArchitectureList(OSKextRef aKext, CFBooleanRef *isFat);
-static void         filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boolean userLoad);
-static Boolean      hashIsInExceptionList(CFURLRef theKextURL, CFDictionaryRef theDict, CFDictionaryRef codesignAttributes);
-static uint64_t     getKextDevModeFlags(void);
-
-Boolean
-authenticateKext(OSKextRef theKext, void *context)
-{
-    Boolean result = false;
-    OSStatus sigResult = 0;
-    const AuthOptions_t *authOptions = (const AuthOptions_t*)context;
-    if (authOptions == NULL) {
-        OSKextLogCFString(NULL,
-                          kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                          CFSTR("Kext rejected due to invalid authentication params: %@"),
-                          theKext);
-        result = false;
-        goto finish;
-    }
-
-    if (OSKextIsInExcludeList(theKext, true)) {
-        OSKextLogCFString(NULL,
-                          kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                          CFSTR("Kext rejected due to presence on exclude list: %@"),
-                          theKext);
-        messageTraceExcludedKext(theKext);
-        result = false;
-        goto finish;
-    }
-
-    if (authOptions->performFilesystemValidation &&
-        !_OSKextBasicFilesystemAuthentication(theKext, NULL)) {
-        OSKextLogCFString(NULL,
-                          kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                          CFSTR("Kext rejected due to improper filesystem permissions: %@"),
-                          theKext);
-        result = false;
-        goto finish;
-    }
-
-    if (authOptions->performSignatureValidation) {
-        sigResult = checkKextSignature(theKext, true, authOptions->allowNetwork);
-        if (sigResult != 0) {
-            if (isInvalidSignatureAllowed()) {
-                OSKextLogCFString(NULL,
-                                  kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                                  CFSTR("Kext with invalid signatured (%ld) allowed: %@"),
-                                  (long)sigResult, theKext);
-            }
-            else {
-                OSKextLogCFString(NULL,
-                                  kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                                  CFSTR("Kext rejected due to invalid signature: %@"),
-                                  theKext);
-                result = false;
-                goto finish;
-            }
-        }
-    }
-
-    if (authOptions->requireSecureLocation) {
-        if (!kextIsInSecureLocation(theKext)) {
-            OSKextLogCFString(NULL,
-                              kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                              CFSTR("Kext rejected due to insecure location: %@"),
-                              theKext);
-            result = false;
-            goto finish;
-        }
-    }
-
-    if (authOptions->respectSystemPolicy) {
-        Boolean allowed = false;
-
-        if (authOptions->isCacheLoad) {
-            allowed = SPAllowKextLoadCache(theKext);
-        } else {
-            allowed = SPAllowKextLoad(theKext);
-        }
-
-        if (!allowed) {
-            OSKextLogCFString(NULL,
-                              kOSKextLogErrorLevel | kOSKextLogValidationFlag,
-                              CFSTR("Kext rejected due to system policy: %@"),
-                              theKext);
-            result = false;
-            goto finish;
-        }
-    }
-
-    result = true;
-
-finish:
-    return result;
-}
+static void         getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer);
+static void         filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList);
+static Boolean hashIsInExceptionList(CFURLRef theKextURL, CFDictionaryRef theDict);
+#if USE_OLD_EXCEPTION_LIST
+static Boolean bundleIdIsInExceptionList(OSKextRef theKext, CFDictionaryRef theDict);
+#endif
 
 /*******************************************************************************
  * messageTraceExcludedKext() - log MessageTracer message for kexts in 
@@ -295,12 +198,10 @@ finish:
 
 /*******************************************************************************
  * getAdhocSignatureHash() - create a hash signature for an unsigned kext
- *  Syrah requires new adhoc signing rules (16411212)
  *******************************************************************************/
 
-void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictionaryRef codesignAttributes)
+static void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer)
 {
-    OSStatus status                     = errSecSuccess;
     CFMutableDictionaryRef signdict     = NULL;   // must release
     SecCodeSignerRef    signerRef       = NULL;   // must release
     SecStaticCodeRef    staticCodeRef   = NULL;   // must release
@@ -316,26 +217,16 @@ void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictiona
     char *              tempBufPtr      = NULL;   // do not free
     CFNumberRef         myNumValue      = NULL;   // must release
     CFNumberRef         myRealValue     = NULL;   // must release
-    CFNumberRef         myHashNumValue  = NULL;   // must release
-
+    
     /* Ad-hoc sign the code temporarily so we can get its hash */
-    if (codesignAttributes) {
-        status = SecStaticCodeCreateWithPathAndAttributes(kextURL,
-                                                          kSecCSDefaultFlags,
-                                                          codesignAttributes,
-                                                          &staticCodeRef);
-    }
-    else {
-        status = SecStaticCodeCreateWithPath(kextURL,
-                                             kSecCSDefaultFlags,
-                                             &staticCodeRef);
-    }
-
-    if (status != errSecSuccess || staticCodeRef == NULL) {
+    if (SecStaticCodeCreateWithPath(kextURL,
+                                    kSecCSDefaultFlags,
+                                    &staticCodeRef) != 0 ||
+        (staticCodeRef == NULL)) {
         OSKextLogMemError();
         goto finish;
     }
-
+    
     signature = CFDataCreateMutable(NULL, 0);
     if (signature == NULL) {
         OSKextLogMemError();
@@ -353,15 +244,6 @@ void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictiona
     CFDictionarySetValue(signdict, kSecCodeSignerIdentity, kCFNull);
     CFDictionarySetValue(signdict, kSecCodeSignerDetached, signature);
     
-    int myHashNum = kSecCodeSignatureHashSHA1;
-    myHashNumValue = CFNumberCreate(kCFAllocatorDefault,
-                                    kCFNumberIntType, &myHashNum);
-    if (myHashNumValue == NULL) {
-        OSKextLogMemError();
-        goto finish;
-    }
-    CFDictionarySetValue(signdict, kSecCodeSignerDigestAlgorithm, myHashNumValue); // 24059794
-
     resourceRules = CFDictionaryCreateMutable(kCFAllocatorDefault, 0,
                                               &kCFTypeDictionaryKeyCallBacks,
                                               &kCFTypeDictionaryValueCallBacks);
@@ -456,7 +338,7 @@ void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictiona
     // add both rules to signdict
     CFDictionarySetValue(signdict, kSecCodeSignerResourceRules, resourceRules);
     
-    if (SecCodeSignerCreate(signdict, kSecCSDefaultFlags | kSecCSSignOpaque, &signerRef) != 0) {
+    if (SecCodeSignerCreate(signdict, kSecCSDefaultFlags, &signerRef) != 0) {
         OSKextLog(NULL, kOSKextLogDebugLevel | kOSKextLogGeneralFlag,
                   "%s - SecCodeSignerCreate failed", __func__);
         goto finish;
@@ -474,18 +356,14 @@ void getAdhocSignatureHash(CFURLRef kextURL, char ** signatureBuffer, CFDictiona
     
     /* get the hash info
      */
-    if (SecCodeCopySigningInformation(staticCodeRef, kSecCSDefaultFlags, &signingDict) != 0
-        || signingDict == NULL) {
+    if (SecCodeCopySigningInformation(staticCodeRef, kSecCSDefaultFlags, &signingDict) != 0) {
         OSKextLog(NULL, kOSKextLogDebugLevel | kOSKextLogGeneralFlag,
                   "%s - SecCodeCopySigningInformation failed", __func__);
         goto finish;
     }
     
-    cdhash = (CFDataRef) CFDictionaryGetValue(signingDict, kSecCodeInfoUnique);
-    // <rdar://problem/24539186> protect against badly signed kexts
-    if (cdhash && CFGetTypeID(cdhash) == CFDataGetTypeID()) {
-        CFRetain(cdhash);
-        
+    cdhash = CFRetain(CFDictionaryGetValue(signingDict, kSecCodeInfoUnique));
+    if (cdhash) {
         const UInt8 *   hashDataPtr     = NULL;  // don't free
         CFIndex         hashDataLen     = 0;
         
@@ -864,7 +742,7 @@ finish:
  *  <rdar://13646260> 
  *  Note: the caller must release the created CFStringRefs
  *******************************************************************************/
-void copySigningInfo(CFURLRef kextURL,
+static void copySigningInfo(CFURLRef kextURL,
                             CFStringRef* cdhash,
                             CFStringRef* teamId,
                             CFStringRef* subjectCN,
@@ -1010,42 +888,12 @@ finish:
 }
 
 /*******************************************************************************
- * Helper to check a personality matches
- *******************************************************************************/
-
- typedef struct {
-     CFMutableArrayRef personalities;
- } __OSKextPersonalityBundleIdentifierContext;
-
- static void __OSKextPersonalityBundleIdentifierApplierFunction(
-     const void * vKey,
-     const void * vValue,
-           void * vContext)
-{
-    CFStringRef            personalityName     = (CFStringRef)vKey;
-    CFMutableDictionaryRef personality         = (CFMutableDictionaryRef)vValue;
-    __OSKextPersonalityBundleIdentifierContext  * context =
-     (__OSKextPersonalityBundleIdentifierContext *)vContext;
-    CFMutableArrayRef      personalities       = context->personalities;
-    io_service_t           match;
-
-    if (!personalities) return;
-
-    CFRetain(personality);
-    match = IOServiceGetMatchingService(kIOMasterPortDefault, personality);
-    if (MACH_PORT_NULL != match) {
-        IOObjectRelease(match);
-        CFArrayAppendValue(personalities, personalityName);
-    }
-}
-
-/*******************************************************************************
  * filterKextLoadForMT() - check that the kext is of interest, and place kext
  * information in the kext list
  *  <rdar://problem/12435992> 
  *******************************************************************************/
 
-static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boolean userLoad)
+static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef *kextList)
 {
     if (aKext == NULL || kextList == NULL)
         return;
@@ -1053,28 +901,30 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
     CFStringRef     versionString;                // do not release
     CFStringRef     bundleIDString;               // do not release
     CFStringRef     kextSigningCategory = NULL;   // do not release
-    CFDateRef       timestamp           = NULL;   // do not release
     CFBooleanRef    isFat               = kCFBooleanFalse; // do not release
     CFBooleanRef    isSigned            = kCFBooleanFalse; // do not release
+    
     CFURLRef        kextURL             = NULL;   // must release
-    CFURLRef        kextExecURL         = NULL;   // must release
     CFStringRef     kextPath            = NULL;   // must release
-    CFStringRef     kextExecPath        = NULL;   // must release
     CFStringRef     filename            = NULL;   // must release
     CFStringRef     hashString          = NULL;   // must release
     CFStringRef     archString          = NULL;   // must release
     CFStringRef     teamId              = NULL;   // must release
     CFStringRef     subjectCN           = NULL;   // must release
     CFStringRef     issuerCN            = NULL;   // must release
-    CFBooleanRef    codeless            = kCFBooleanFalse;
-    SecStaticCodeRef        code          = NULL;   // must release
-    CFDictionaryRef         information   = NULL;   // must release
-    CFDictionaryRef         personalities = NULL;   // must release
-    CFMutableDictionaryRef  kextDict      = NULL;   // must release
+    
+    SecStaticCodeRef        code        = NULL;   // must release
+    CFDictionaryRef         information = NULL;   // must release
+    CFMutableDictionaryRef  kextDict    = NULL;   // must release
+    
     char *          hashCString         = NULL;   // must free
-    OSStatus status = noErr;
 
-    __OSKextPersonalityBundleIdentifierContext context = { 0 };
+    OSStatus status = noErr;
+    
+    /* do not message trace this if boot-args has debug set */
+    if (isDebugSetInBootargs()) {
+        return;
+    }
     
     kextURL = CFURLCopyAbsoluteURL(OSKextGetURL(aKext));
     if (!kextURL) {
@@ -1094,14 +944,7 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
     filename = CFURLCopyLastPathComponent(kextURL);
     
     archString = createArchitectureList(aKext, &isFat);
-
-    if (OSKextDeclaresExecutable(aKext)) {
-        kextExecURL = CFURLCopyAbsoluteURL(OSKextGetExecutableURL(aKext));
-        if (kextExecURL) kextExecPath = CFURLCopyFileSystemPath(kextExecURL, kCFURLPOSIXPathStyle);
-    } else {
-        codeless = kCFBooleanTrue;
-    }
-
+    
     if (SecStaticCodeCreateWithPath(kextURL,
                                     kSecCSDefaultFlags,
                                     &code) != 0
@@ -1122,7 +965,7 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
          * A hash of the kext is generated for data collection. */
         kextSigningCategory = CFSTR(kUnsignedKext);
         
-        getAdhocSignatureHash(kextURL, &hashCString, NULL);
+        getAdhocSignatureHash(kextURL, &hashCString);
         if (hashCString) {
             hashString = CFStringCreateWithCString(kCFAllocatorDefault,
                                                    hashCString,
@@ -1132,19 +975,17 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
     else {
         CFStringRef myCFString = NULL; // do not release
         myCFString = OSKextGetIdentifier(aKext);
-
-        timestamp = CFDictionaryGetValue(information, kSecCodeInfoTimestamp);
-        if (timestamp && (CFDateGetTypeID() != CFGetTypeID(timestamp))) {
-            timestamp = NULL;
-        }
-
-        /* MT functions are avoided in early boot, so the network is always available */
-        status = checkKextSignature(aKext, true, true);
+        status = checkKextSignature(aKext, true, false);
         if (CFStringHasPrefix(myCFString, __kOSKextApplePrefix)) {
             if (status == noErr) {
                 /* This is a signed Apple kext, with an Apple root certificate.
-                 * There is no need to log these, so simply jump to the cleanup */
-                goto finish;
+                 * There is no need to retrieve additional signing information */
+                kextSigningCategory = CFSTR(kAppleKextWithAppleRoot);
+                copySigningInfo(kextURL,
+                                &hashString,
+                                NULL,
+                                NULL,
+                                NULL);
             }
             else {
                 /* This is a signed Apple kext, but the root certificate is not Apple.
@@ -1223,21 +1064,7 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
             }
         }
     }
-
-    personalities = OSKextGetValueForInfoDictionaryKey(aKext,
-        CFSTR(kIOKitPersonalitiesKey));
-    if (personalities
-        && (CFGetTypeID(personalities) == CFDictionaryGetTypeID())
-        && (CFDictionaryGetCount(personalities) > 1))
-    {
-        context.personalities = CFArrayCreateMutable(kCFAllocatorDefault,
-                                                     0,
-                                                     &kCFTypeArrayCallBacks);
-        CFDictionaryApplyFunction(personalities,
-            __OSKextPersonalityBundleIdentifierApplierFunction,
-            &context);
-    }
-
+        
     kextDict = CFDictionaryCreateMutable(kCFAllocatorDefault,
                                          0,
                                          &kCFTypeDictionaryKeyCallBacks,
@@ -1307,38 +1134,13 @@ static void filterKextLoadForMT(OSKextRef aKext, CFMutableArrayRef kextList, Boo
                              kextPath);
     }
 
-    if (kextExecPath) {
-        CFDictionaryAddValue(kextDict,
-                             CFSTR(kMessageTracerExecPathKey),
-                             kextExecPath);
-    }
-
-    if (timestamp) {
-        CFDictionaryAddValue(kextDict,
-                             CFSTR(kMessageTracerSigningTimeKey),
-                             timestamp);
-    }
-
-    CFDictionaryAddValue(kextDict, CFSTR(kMessageTracerCodelessKey), codeless);
-
-    if (userLoad) {
-        CFDictionaryAddValue(kextDict, CFSTR(kMessageTracerUserLoadKey), kCFBooleanTrue);
-    }
-
-    if (context.personalities && CFArrayGetCount(context.personalities)) {
-        CFDictionaryAddValue(kextDict,
-                             CFSTR(kMessageTracerPersonalityNamesKey),
-                             context.personalities);
-    }
-
-    CFArrayAppendValue(kextList, kextDict);
+    
+    CFArrayAppendValue(*kextList, kextDict);
     
 finish:
     SAFE_FREE(hashCString);
     SAFE_RELEASE(kextURL);
-    SAFE_RELEASE(kextExecURL);
     SAFE_RELEASE(kextPath);
-    SAFE_RELEASE(kextExecPath);
     SAFE_RELEASE(filename);
     SAFE_RELEASE(hashString);
     SAFE_RELEASE(kextDict);
@@ -1348,7 +1150,6 @@ finish:
     SAFE_RELEASE(issuerCN);
     SAFE_RELEASE(code);
     SAFE_RELEASE(information);
-    SAFE_RELEASE(context.personalities);
     return;
 }
 
@@ -1357,7 +1158,7 @@ finish:
  *  <rdar://problem/12435992> 
  *******************************************************************************/
 void
-recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad)
+recordKextLoadListForMT(CFArrayRef kextList)
 {
     CFIndex             count, i;
     CFMutableArrayRef   kextsToMessageTrace = NULL; //must release
@@ -1370,7 +1171,7 @@ recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad)
         if (kextsToMessageTrace) {
             for (i = 0; i < count; i ++) {                
                 aKext = (OSKextRef)CFArrayGetValueAtIndex(kextList, i);
-                filterKextLoadForMT(aKext, kextsToMessageTrace, userLoad);
+                filterKextLoadForMT(aKext, &kextsToMessageTrace);
             }
             if (CFArrayGetCount(kextsToMessageTrace)) {
                 postNoteAboutKextLoadsMT(CFSTR("Loaded Kext Notification"),
@@ -1385,7 +1186,7 @@ recordKextLoadListForMT(CFArrayRef kextList, Boolean userLoad)
  * recordKextLoadForMT() - record the loaded kext
  *  <rdar://problem/12435992>
  *******************************************************************************/
-void recordKextLoadForMT(OSKextRef aKext, Boolean userLoad)
+void recordKextLoadForMT(OSKextRef aKext)
 {
     CFMutableArrayRef myArray = NULL; // must release
     
@@ -1397,7 +1198,7 @@ void recordKextLoadForMT(OSKextRef aKext, Boolean userLoad)
                                    &kCFTypeArrayCallBacks);
     if (myArray) {
         CFArrayAppendValue(myArray, aKext);
-        recordKextLoadListForMT(myArray, userLoad);
+        recordKextLoadListForMT(myArray);
         SAFE_RELEASE(myArray);
     }
 }
@@ -1407,7 +1208,7 @@ void recordKextLoadForMT(OSKextRef aKext, Boolean userLoad)
  *******************************************************************************/
 OSStatus checkKextSignature(OSKextRef aKext,
                             Boolean checkExceptionList,
-                            Boolean allowNetwork)
+                            Boolean earlyBoot)
 {
     OSStatus                result          = errSecCSSignatureFailed;
     CFURLRef                kextURL         = NULL;   // must release
@@ -1415,7 +1216,6 @@ OSStatus checkKextSignature(OSKextRef aKext,
     SecRequirementRef       requirementRef  = NULL;   // must release
     CFStringRef             myCFString;
     CFStringRef             requirementsString;
-    SecCSFlags              flags = 0;
     
     if (aKext == NULL) {
         return result;
@@ -1460,31 +1260,22 @@ OSStatus checkKextSignature(OSKextRef aKext,
         OSKextLogMemError();
         goto finish;
     }
-
-    // Set up flags based on whether the network is allowed.
-    flags = kSecCSCheckAllArchitectures | kSecCSStrictValidate;
-    flags |= allowNetwork ? kSecCSEnforceRevocationChecks : kSecCSNoNetworkAccess;
-
-    result = SecStaticCodeCheckValidity(staticCodeRef, flags, requirementRef);
-
+    
+    // errSecCSUnsigned == -67062
+    if (earlyBoot) {
+        result = SecStaticCodeCheckValidity(staticCodeRef,
+                                            kSecCSNoNetworkAccess,
+                                            requirementRef);
+    }
+    else {
+        result = SecStaticCodeCheckValidity(staticCodeRef,
+                                            kSecCSEnforceRevocationChecks,
+                                            requirementRef);
+    }
     if ( result != 0 &&
-        checkExceptionList ) {
-        if (errSecCSWeakResourceEnvelope == result ||
-            errSecCSBadObjectFormat == result ||
-            errSecCSBadMainExecutable == result) {
-            // errSecCSWeakResourceEnvelope == -67007
-            // errSecCSBadObjectFormat == -67049
-            // errSecCSBadMainExecutable == -67010
-            // <rdar://problem/24773482>
-            if (isInStrictExceptionList(aKext, kextURL, true)) {
-                result = 0;
-            }
-        }
-        else {
-            if (isInExceptionList(aKext, kextURL, true)) {
-                result = 0;
-            }
-        }
+        checkExceptionList &&
+        isInExceptionList(aKext, kextURL, true) ) {
+        result = 0;
     }
     
 finish:
@@ -1495,6 +1286,16 @@ finish:
     return result;
 }
 
+#define GET_CSTRING_PTR(the_cfstring, the_ptr, the_buffer, the_size) \
+do { \
+the_ptr = CFStringGetCStringPtr(the_cfstring, kCFStringEncodingUTF8); \
+if (the_ptr == NULL) { \
+the_buffer[0] = 0x00; \
+the_ptr = the_buffer;  \
+CFStringGetCString(the_cfstring, the_buffer, the_size, kCFStringEncodingUTF8); \
+} \
+} while(0)
+
 /*********************************************************************
  * isInExceptionList checks to see if the given kext is in the
  * kext signing exception list (in com.apple.driver.KextExcludeList).  
@@ -1504,7 +1305,7 @@ finish:
  * The kext signing exception list rarely changes but to insure you have the 
  * most recent copy in the cache pass FALSE for the first call and TRUE for
  * subsequent calls (when dealing with a large list of kexts).
- * theKext and theKextURL can be NULL if you just want to invalidate the cache.
+ * theKext can be NULL if you just want the invalidate the cache.
  *********************************************************************/
 Boolean isInExceptionList(OSKextRef theKext,
                           CFURLRef  theKextURL,
@@ -1515,6 +1316,9 @@ Boolean isInExceptionList(OSKextRef theKext,
     CFStringRef         kextID                      = NULL; // must release
     OSKextRef           excludelistKext             = NULL; // must release
     CFDictionaryRef     tempDict                    = NULL; // do NOT release
+#if USE_OLD_EXCEPTION_LIST
+    static CFDictionaryRef sExceptionListDict       = NULL; // do NOT release
+#endif
     static CFDictionaryRef sExceptionHashListDict   = NULL; // do NOT release
     
     /* invalidate the exception list "by hash" cache or create if not
@@ -1538,11 +1342,8 @@ Boolean isInExceptionList(OSKextRef theKext,
             goto finish;
         }
         
-        /* can we trust AppleKextExcludeList.kext? 
-         * If we are NOT allowing untrusted kexts then make sure
-         * AppleKextExcludeList.kext is valid!
-         */
-        if (csr_check(CSR_ALLOW_UNTRUSTED_KEXTS) != 0) {
+        /* can we trust AppleKextExcludeList.kext */
+        if (isDevMode() == false) {
             if (checkKextSignature(excludelistKext, false, false) != 0) {
                 char kextPath[PATH_MAX];
                 
@@ -1567,116 +1368,42 @@ Boolean isInExceptionList(OSKextRef theKext,
         if (tempDict) {
             if ((unsigned int)CFDictionaryGetCount(tempDict) > 0) {
                 sExceptionHashListDict = CFDictionaryCreateCopy(NULL, tempDict);
+                if (sExceptionHashListDict == NULL) {
+                    OSKextLogMemError();
+                }
             }
         }
     }
-
-    /* Passing both arguments as NULL is just a way to prime the cache (above),
-     * so there's no more work to do.
-     */
-    if (theKext == NULL && theKextURL == NULL) {
-        goto finish;
-    }
     
-    if (sExceptionHashListDict) {
-        if (theKextURL == NULL) {
-            kextURL = CFURLCopyAbsoluteURL(OSKextGetURL(theKext));
-            if (kextURL == NULL) {
-                OSKextLogMemError();
+    /* invalidate the exception list "by bundle ID" cache or create if not 
+     * present 
+     */
+#if USE_OLD_EXCEPTION_LIST
+    if (useCache == false || sExceptionListDict == NULL) {
+        if (sExceptionListDict) {
+            SAFE_RELEASE_NULL(sExceptionListDict);
+        }
+        
+        if (kextID == NULL) {
+            kextID = CFStringCreateWithCString(kCFAllocatorDefault,
+                                               "com.apple.driver.KextExcludeList",
+                                               kCFStringEncodingUTF8);
+            if (kextID == NULL) {
+                OSKextLogStringError(/* kext */ NULL);
                 goto finish;
             }
-            theKextURL = kextURL;
-        }
-        if (hashIsInExceptionList(theKextURL, sExceptionHashListDict, NULL)) {
-            result = true;
-            goto finish;
-        }
-    }
-    
-finish:
-    SAFE_RELEASE(kextURL);
-    SAFE_RELEASE(kextID);
-    SAFE_RELEASE(excludelistKext);
-    return result;
-}
-
-
-/* Need to check an additional exception list when the signature check
- * failure is due to strict validation errors.
- * Error: 0xFFFEFA41 -67007 resource envelope is obsolete (version 1 signature)
- * <rdar://problem/24773482>
- */
-Boolean isInStrictExceptionList(OSKextRef theKext,
-                                CFURLRef  theKextURL,
-                                Boolean   useCache)
-{
-    Boolean             result                      = false;
-    CFURLRef            kextURL                     = NULL; // must release
-    CFStringRef         kextID                      = NULL; // must release
-    OSKextRef           excludelistKext             = NULL; // must release
-    CFDictionaryRef     tempDict                    = NULL; // do NOT release
-    CFMutableDictionaryRef attributes               = NULL; // must release
-    static CFDictionaryRef sStrictExceptionHashListDict = NULL; // do NOT release
-    const NXArchInfo   *targetArch                  = NULL;  // do not free
-    CFStringRef         archName                    = NULL; // must release
-    
-    // For strict validation, the exception list has an entry for each kext and each architecture
-    // it is intended to cover so that we only have to check the cdhash of the currently
-    // running kernel architecture that will be loaded.
-    // <rdar://problem/27010141>
-    attributes = CFDictionaryCreateMutable(kCFAllocatorDefault,
-                                           1,
-                                           &kCFTypeDictionaryKeyCallBacks,
-                                           &kCFTypeDictionaryValueCallBacks);
-    if (!attributes) {
-        OSKextLogMemError();
-        goto finish;
-    }
-    
-    targetArch = OSKextGetRunningKernelArchitecture();
-    if (!targetArch) {
-        OSKextLogCFString(theKext,
-            kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
-            kOSKextLogAuthenticationFlag | kOSKextLogGeneralFlag,
-            CFSTR("Loading kext with identifier %@ failed retrieving running kernel architecture."),
-            OSKextGetIdentifier(theKext));
-        goto finish;
-    }
-    
-    archName = CFStringCreateWithCString(NULL, targetArch->name, kCFStringEncodingASCII);
-    if (!archName) {
-        OSKextLogMemError();
-        goto finish;
-    }
-    
-    CFDictionaryAddValue(attributes, kSecCodeAttributeArchitecture, archName);
-    
-    /* invalidate the exception list "by hash" cache or create if not
-     * present
-     */
-    if (useCache == false || sStrictExceptionHashListDict == NULL) {
-        if (sStrictExceptionHashListDict) {
-            SAFE_RELEASE_NULL(sStrictExceptionHashListDict);
-        }
-        kextID = CFStringCreateWithCString(kCFAllocatorDefault,
-                                           "com.apple.driver.KextExcludeList",
-                                           kCFStringEncodingUTF8);
-        if (kextID == NULL) {
-            OSKextLogStringError(/* kext */ NULL);
-            goto finish;
         }
         
-        excludelistKext = OSKextCreateWithIdentifier(kCFAllocatorDefault,
-                                                     kextID);
         if (excludelistKext == NULL) {
-            goto finish;
+            excludelistKext = OSKextCreateWithIdentifier(kCFAllocatorDefault,
+                                                         kextID);
+            if (excludelistKext == NULL) {
+                goto finish;
+            }
         }
         
-        /* can we trust AppleKextExcludeList.kext?
-         * If we are NOT allowing untrusted kexts then make sure
-         * AppleKextExcludeList.kext is valid!
-         */
-        if (csr_check(CSR_ALLOW_UNTRUSTED_KEXTS) != 0) {
+        /* can we trust AppleKextExcludeList.kext */
+        if (isDevMode() == false) {
             if (checkKextSignature(excludelistKext, false, false) != 0) {
                 char kextPath[PATH_MAX];
                 
@@ -1696,23 +1423,24 @@ Boolean isInStrictExceptionList(OSKextRef theKext,
         }
         
         tempDict = OSKextGetValueForInfoDictionaryKey(
-                                                      excludelistKext,
-                                                      CFSTR("OSKextStrictExceptionHashList") );
+                                            excludelistKext,
+                                            CFSTR("OSKextSigExceptionList"));
         if (tempDict) {
             if ((unsigned int)CFDictionaryGetCount(tempDict) > 0) {
-                sStrictExceptionHashListDict = CFDictionaryCreateCopy(NULL, tempDict);
+                sExceptionListDict = CFDictionaryCreateCopy(NULL, tempDict);
+                if (sExceptionListDict == NULL) {
+                    OSKextLogMemError();
+                }
             }
         }
     }
+#endif
     
-    /* Passing both arguments as NULL is just a way to prime the cache (above),
-     * so there's no more work to do.
-     */
-    if (theKext == NULL && theKextURL == NULL) {
+    if (theKext == NULL) {
         goto finish;
     }
-
-    if (sStrictExceptionHashListDict) {
+   
+    if (sExceptionHashListDict) {
         if (theKextURL == NULL) {
             kextURL = CFURLCopyAbsoluteURL(OSKextGetURL(theKext));
             if (kextURL == NULL) {
@@ -1721,32 +1449,106 @@ Boolean isInStrictExceptionList(OSKextRef theKext,
             }
             theKextURL = kextURL;
         }
-        if (hashIsInExceptionList(theKextURL, sStrictExceptionHashListDict, attributes)) {
+        if (hashIsInExceptionList(theKextURL, sExceptionHashListDict)) {
             result = true;
             goto finish;
-        } else {
-            char kextPath[PATH_MAX];
-            if (!CFURLGetFileSystemRepresentation(OSKextGetURL(theKext),
-                                                  false, (UInt8 *)kextPath, sizeof(kextPath))) {
-                strlcpy(kextPath, "(unknown)", sizeof(kextPath));
-            }
-            OSKextLog(theKext,
-                      kOSKextLogErrorLevel | kOSKextLogArchiveFlag |
-                      kOSKextLogAuthenticationFlag | kOSKextLogGeneralFlag,
-                      "%s does not appear in strict exception list for architecture: %s",
-                      kextPath, targetArch->name);
         }
     }
     
+#if USE_OLD_EXCEPTION_LIST
+    if (sExceptionListDict) {
+        if (bundleIdIsInExceptionList(theKext, sExceptionListDict)) {
+            result = true;
+            goto finish;
+        }
+    }
+#endif
+    
 finish:
-    SAFE_RELEASE(archName);
-    SAFE_RELEASE(attributes);
     SAFE_RELEASE(kextURL);
     SAFE_RELEASE(kextID);
     SAFE_RELEASE(excludelistKext);
     return result;
 }
 
+#if USE_OLD_EXCEPTION_LIST
+/*********************************************************************
+ * theDict is a dictionary with keys / values of:
+ *  key = bundleID string of kext we will allow to load inspite of signing
+ *      failure.
+ *  value = version string of kext to allow to load.
+ *      The value is used to check equal or less than a kext with a matching
+ *      version string.  For example if an entry in the list has key:
+ *      com.foocompany.fookext
+ *      and value:
+ *      4.2.10
+ *      Then any kext with bundle ID of com.foocompany.fookext and a version
+ *      string of 4.2.10 or less will be allowed to load even if there is a
+ *      a kext signing validation failure.
+ *
+ * NOTE - Kext versions use an extended Mac OS 'vers' format with double
+ * the number of digits before the build stage: ####.##.##s{1-255} where 's'
+ * is a build stage 'd', 'a', 'b', 'f' or 'fc'.  We parse this with
+ * OSKextParseVersionString
+ *********************************************************************/
+
+static Boolean bundleIdIsInExceptionList(OSKextRef          theKext,
+                                         CFDictionaryRef    theDict)
+{
+    Boolean         result                  = false;
+    CFStringRef     bundleID                = NULL;  // do NOT release
+    CFStringRef     exceptionKextVersString = NULL;  // do NOT release
+    OSKextVersion   kextVers                = -1;
+    const char *    versCString             = NULL;  // do not free
+    OSKextVersion   exceptionKextVers;
+    char            versBuffer[256];
+
+    bundleID = OSKextGetIdentifier(theKext);
+    if (!bundleID) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogDebugLevel | kOSKextLogGeneralFlag,
+                  "%s could not get bundleID",
+                  __FUNCTION__);
+        goto finish;
+    }
+    
+    kextVers = OSKextGetVersion(theKext);
+    if (!kextVers) {
+        OSKextLog(/* kext */ NULL,
+                  kOSKextLogDebugLevel | kOSKextLogGeneralFlag,
+                  "%s could not get kextVers",
+                  __FUNCTION__);
+        goto finish;
+    }
+    
+    exceptionKextVersString = CFDictionaryGetValue(theDict, bundleID);
+    if (!exceptionKextVersString) {
+        goto finish;
+    }
+    
+    /* parse version strings */
+    GET_CSTRING_PTR(exceptionKextVersString,
+                    versCString,
+                    versBuffer,
+                    sizeof(versBuffer));
+    if (strlen(versCString) < 1) {
+        goto finish;
+    }
+    
+    exceptionKextVers = OSKextParseVersionString(versCString);
+    if (kextVers <= exceptionKextVers) {
+        OSKextLogCFString(NULL,
+                          kOSKextLogGeneralFlag | kOSKextLogErrorLevel,
+                          CFSTR("kext %@  %lld is in exception list, allowing to load"),
+                          bundleID, kextVers);
+        result = true;
+    }
+    
+finish:
+    
+    return result;
+}
+#endif
 
 /*********************************************************************
  * theDict is a dictionary with keys / values of:
@@ -1766,16 +1568,10 @@ finish:
  *          <string>3.3.0</string>
  *      </dict>
  * </dict>
- *
- *
- * codesignAttributes is a dictionary of codesigning attributes to pass in to
- * SecStaticCodeCreateWithPathAndAttributes that controls exactly how the
- * hash is generated.
  *********************************************************************/
 
 static Boolean hashIsInExceptionList(CFURLRef           theKextURL,
-                                     CFDictionaryRef    theDict,
-                                     CFDictionaryRef    codesignAttributes)
+                                     CFDictionaryRef    theDict)
 {
     Boolean         result              = false;
     char *          hashCString         = NULL;     // must free
@@ -1786,8 +1582,9 @@ static Boolean hashIsInExceptionList(CFURLRef           theKextURL,
         goto finish;
     }
     
-    /* generate the hash for the kext to look up in exception list */
-    getAdhocSignatureHash(theKextURL, &hashCString, codesignAttributes);
+    /* generate the hash for unsigned kext to look up in exception list
+     */
+    getAdhocSignatureHash(theKextURL, &hashCString);
     if (hashCString == NULL) {
         goto finish;
     }
@@ -1818,62 +1615,40 @@ finish:
     return result;
 }
 
-#define KEXT_DEV_MODE_STRING "kext-dev-mode="
-
-enum {
-    // ignore kext signature check failures
-    kKextDevModeFlagsIgnoreKextSigFailures  =   0x00000001ULL,
-    // disable auto rebuilding of prelinked kernel, NOTE if this is set
-    // the prelinked kernel must be explicitly rebuilt via the kextcache
-    // command line tool.  touch /S/L/E or any other "automatic triggers" will
-    // not rebuild prelinked kernel
-    kKextDevModeFlagsDisableAutoRebuild     =   0x00000002ULL,
-};
-
-#if 0 // obsolete with 19635687
 /*******************************************************************************
  * isDevMode() - check to see if this machine is in "kext developer mode"
  *******************************************************************************/
+#define KEXT_DEV_MODE_STRING "kext-dev-mode="
+
 Boolean isDevMode(void)
 {
-    uint64_t    kextDevModeFlags;
-    
-    kextDevModeFlags = getKextDevModeFlags();
-    
-    return(kextDevModeFlags & kKextDevModeFlagsIgnoreKextSigFailures);
-}
-#endif
-
-Boolean isPrelinkedKernelAutoRebuildDisabled(void)
-{
-    uint64_t    kextDevModeFlags = 0x00;
-    
-    /* only skip auto rebuild if kernel debugging allowed */
-    if (csr_check(CSR_ALLOW_UNTRUSTED_KEXTS) == 0) {
-        kextDevModeFlags = getKextDevModeFlags();
-    }
-    return(kextDevModeFlags & kKextDevModeFlagsDisableAutoRebuild);
-}
-
-static uint64_t getKextDevModeFlags(void)
-{
-    uint64_t    kext_dev_mode = 0;
+    Boolean     result          = false;
+    uint64_t    kext_dev_mode;
     size_t      bufsize;
     char        bootargs_buffer[1024], *dev_mode_ptr;
     
+    
     bufsize = sizeof(bootargs_buffer);
-    if (sysctlbyname("kern.bootargs", bootargs_buffer, &bufsize, NULL, 0) >= 0) {
-        dev_mode_ptr = strnstr(bootargs_buffer,
-                               KEXT_DEV_MODE_STRING,
-                               sizeof(bootargs_buffer));
-        if (dev_mode_ptr &&
-            (dev_mode_ptr == &bootargs_buffer[0] || *(dev_mode_ptr - 1) == ' ')) {
-            
-            kext_dev_mode = strtoul(dev_mode_ptr + strlen(KEXT_DEV_MODE_STRING),
-                                    NULL, 16);
+    if (sysctlbyname("kern.bootargs", bootargs_buffer, &bufsize, NULL, 0) < 0) {
+        return(false);
+    }
+    
+    /* looking for "kext-dev-mode=1", no prefix allowed and we currently only
+     * support a value of '1' all else are ignored.
+     */
+    dev_mode_ptr = strnstr(bootargs_buffer,
+                           KEXT_DEV_MODE_STRING,
+                           sizeof(bootargs_buffer));
+    if (dev_mode_ptr &&
+        (dev_mode_ptr == &bootargs_buffer[0] || *(dev_mode_ptr - 1) == ' ')) {
+        kext_dev_mode = strtoul(dev_mode_ptr + strlen(KEXT_DEV_MODE_STRING),
+                                NULL, 10);
+        if (kext_dev_mode == 1) {
+            result = true;
         }
     }
-    return(kext_dev_mode);
+    
+    return(result);
 }
 
 /*********************************************************************
@@ -1921,18 +1696,11 @@ Boolean isInSystemLibraryExtensionsFolder(OSKextRef theKext)
 Boolean isInvalidSignatureAllowed(void)
 {
     Boolean      result = false;      // default to not allowed
- 
-    if (csr_check(CSR_ALLOW_UNTRUSTED_KEXTS) == 0 || csr_check(CSR_ALLOW_APPLE_INTERNAL) == 0) {
-        // Allow kext signature check errors
+    
+    if (isDevMode()) {
         result = true;
     }
-    else {
-        // Do not allow kext signature check errors
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel  | kOSKextLogGeneralFlag,
-                  "Untrusted kexts are not allowed");
-    }
-
+    
     return(result);
 }
 #include <Security/SecKeychainPriv.h>
@@ -1982,100 +1750,3 @@ Boolean isKextdRunning(void)
     
     return( FALSE );
 }
-
-Boolean isNetBooted(void)
-{
-    Boolean isNetBooted = FALSE;
-    uint32_t isNetBootInt = 0;
-    size_t size = sizeof(isNetBootInt);
-    int error = 0;
-
-    error = sysctlbyname("kern.netboot", (void*)&isNetBootInt, &size, NULL, 0);
-    if (error != 0)
-    {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                  "Unable to read netboot sysctl: %d", error);
-        isNetBooted = FALSE;
-        goto __out;
-    }
-
-    isNetBooted = isNetBootInt != 0;
-
-__out:
-    return isNetBooted;
-}
-
-#if HAVE_DANGERZONE
-
-/*******************************************************************************
- * copyKextPathToBuffer - Helper function to copy a kext path into a provided buffer.
- *******************************************************************************/
-void copyKextPathToBuffer(OSKextRef kext, char *buffer, size_t buffer_size) {
-    CFStringRef kextPath = copyKextPath(kext);
-    if (!kextPath) {
-        goto __out;
-    }
-    if (!CFStringGetCString(kextPath, buffer, buffer_size, kCFStringEncodingUTF8)) {
-        OSKextLog(/* kext */ NULL,
-                  kOSKextLogErrorLevel | kOSKextLogGeneralFlag,
-                  "failed to copy kext path");
-        goto __out;
-    }
-__out:
-    SAFE_RELEASE(kextPath);
-}
-
-/*******************************************************************************
- * dzRecordKextLoad* - Helper functions to notify the DangerZone subsystem about
- * various types of kext load scenarios.
- *******************************************************************************/
-void dzRecordKextLoadUser(OSKextRef kext, bool allowed) {
-    if (dz_notify_kext_load_v2 == NULL) {
-        // libdz is weak linked for use in old OS environments.
-        return;
-    }
-    char localKextPath[PATH_MAX] = {0};
-    copyKextPathToBuffer(kext, localKextPath, sizeof(localKextPath));
-    dz_notify_kext_load_v2(DZ_KEXT_LOAD_KEXTD_USER, localKextPath, DZ_KEXT_LOAD_FLAG_NONE, allowed);
-}
-
-void dzRecordKextLoadKernel(OSKextRef kext, bool allowed) {
-    if (dz_notify_kext_load_v2 == NULL) {
-        // libdz is weak linked for use in old OS environments.
-        return;
-    }
-    char localKextPath[PATH_MAX] = {0};
-    copyKextPathToBuffer(kext, localKextPath, sizeof(localKextPath));
-
-    dz_notify_kext_load_v2(DZ_KEXT_LOAD_KEXTD_KERNEL, localKextPath, DZ_KEXT_LOAD_FLAG_NONE, allowed);
-}
-
-void dzRecordKextLoadBypass(OSKextRef kext, bool allowed) {
-    // Note: dzRecordKextLoadBypass will only be called for kexts that are allowed to load. The current code structure
-    // is difficult to instrument for denials, and in the future shouldn't be a code path that exists for non-early
-    // boot scenarios.
-    if (dz_notify_kext_load_v2 == NULL) {
-        // libdz is weak linked for use in old OS environments.
-        return;
-    }
-    char localKextPath[PATH_MAX] = {0};
-    copyKextPathToBuffer(kext, localKextPath, sizeof(localKextPath));
-    dz_notify_kext_load_v2(DZ_KEXT_LOAD_KEXTD_BYPASS, localKextPath, DZ_KEXT_LOAD_FLAG_NONE, allowed);
-}
-
-/*******************************************************************************
- * dzRecordKextCacheAdd - Helper function to notify the Danger Zone subsystem
- * of the inclusion of a kext in a kext cache.
- *******************************************************************************/
-void dzRecordKextCacheAdd(OSKextRef kext, bool allowed) {
-    if (dz_notify_kextcache_update_v2 == NULL) {
-        // libdz is weak linked for use in old OS environments.
-        return;
-    }
-    char localKextPath[PATH_MAX] = {0};
-    copyKextPathToBuffer(kext, localKextPath, sizeof(localKextPath));
-    dz_notify_kextcache_update_v2(localKextPath, allowed);
-}
-
-#endif // HAVE_DANGERZONE

@@ -44,7 +44,7 @@ typedef enum {
 
     kBRUCachesOnly         = 1 << 1,    // -caches-only: don't update helpers
     kBRUHelpersOptional    = 1 << 2,    // -Installer: helper updates !req'd
-    // kBRUExpectUpToDate     = 1 << 3,    // -U: successful updates -> EX_OSFILE (in bootroot.h)
+    kBRUExpectUpToDate     = 1 << 3,    // -U: successful updates -> EX_OSFILE
     kBRUEarlyBoot          = 1 << 4,    // -Boot: launch* calling us
 
     kBRUInvalidateKextcache = 1 << 5,   // -i: mimic sudo touch /S/L/Extensions
@@ -52,12 +52,8 @@ typedef enum {
     // needUpdates() opt (default is all caches, default-bootable)
     kBRUCachesAnyRoot       = 1 << 6,   // non-default B!=R configs okay
 
-    kBRUImmutableKernel     = 1 << 7,   // -X: build-immutable-kernel
-
     // copy files opts
-
     // kBRAnyBootStamps = 0x10000 (1<<16) // in bootroot.h
-    // kBRUseStagingDir = 0x20000 (1<<17) // in bootroot.h
 } BRUpdateOpts_t;
 
 // in update_boot.c
