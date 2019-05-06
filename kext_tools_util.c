@@ -29,6 +29,7 @@
 #endif  // !TARGET_OS_EMBEDDED
 
 #include <libc.h>
+#include <stdint.h>
 #include <sysexits.h>
 #include <asl.h>
 #include <syslog.h>
@@ -36,6 +37,10 @@
 #include <IOKit/kext/OSKext.h>
 #include <IOKit/kext/OSKextPrivate.h>
 #include <sandbox/rootless.h>
+#include <os/log_private.h>
+
+#include <sys/types.h>
+#include <sys/sysctl.h>
 
 #include "kext_tools_util.h"
 
@@ -449,6 +454,70 @@ Boolean isDebugSetInBootargs(void)
 }
 
 #endif  // !TARGET_OS_EMBEDDED
+
+/*******************************************************************************
+ * createRawBytesFromHexString() - Given an ASCII hex string + length, dump the
+ * computer-readable equivalent into a byte pointer. **Only accepts hex strings
+ * of even length, because I'm lazy.**
+ *******************************************************************************/
+Boolean createRawBytesFromHexString(char *bytePtr, size_t byteLen, const char *hexPtr, size_t hexLen)
+{
+    size_t minByteLen = (hexLen + 1)/2;
+
+    if (!bytePtr || !hexPtr) {
+        return false;
+    } else if (hexLen % 2 != 0) {
+        return false;
+    } else if (minByteLen > byteLen) {
+        return false;
+    }
+
+    /* reset the output to 0 */
+    memset(bytePtr, 0, minByteLen);
+
+    for (size_t index = 0; index < hexLen; index++) {
+        uint8_t nibble;
+        uint8_t shift = (((index + 1) % 2) ? 4 : 0);
+        char    hex   = hexPtr[index];
+
+        if ('0' <= hex && hex <= '9') {
+            nibble = hex - '0';
+        } else if ('A' <= hex && hex <= 'F') {
+            nibble = 10 + (hex - 'A');
+        } else if ('a' <= hex && hex <= 'f') {
+            nibble = 10 + (hex - 'a');
+        } else {
+            return false;
+        }
+        bytePtr[index/2] += (nibble << shift);
+    }
+    return true;
+}
+
+/*******************************************************************************
+ * createHexStringFromRawBytes() - Given a byte pointer + length, dump the
+ * human-readable equivalent into a hex string pointer.
+ *******************************************************************************/
+Boolean createHexStringFromRawBytes(char *hexPtr, size_t hexLen, const char *bytePtr, size_t byteLen)
+{
+    size_t minHexLen = (byteLen * 2) + 1;
+    const char *hexes = "0123456789abcdef";
+
+    if (!hexPtr || !bytePtr) {
+        return false;
+    } else if (minHexLen > hexLen) {
+        return false;
+    }
+
+    for (size_t bidx = 0, hidx = 0; bidx < byteLen; bidx++) {
+        const uint8_t byte = (const uint8_t)bytePtr[bidx];
+        hexPtr[hidx++] = hexes[byte >> 4];
+        hexPtr[hidx++] = hexes[byte & 0x0f];
+    }
+    /* NULL-terminate */
+    hexPtr[minHexLen-1] = 0;
+    return true;
+}
 
 #if PRAGMA_MARK
 #pragma mark Path & File
@@ -1246,20 +1315,59 @@ void beQuiet(void)
     return;
 }
 
+bool
+get_kextlog(uint32_t *mode)
+{
+    char bootargs[1024];
+    size_t size = sizeof(bootargs);
+    char *kextlog;
+
+    if (sysctlbyname("kern.bootargs", bootargs, &size, NULL, 0) == 0 && (kextlog = strcasestr(bootargs, "kextlog=")) != NULL) {
+        char *token = NULL;
+        uint32_t value = (uint32_t)strtoul(&kextlog[strlen("kextlog=")], &token, 16);
+        if (token == NULL || (*token) == '\0' || isspace(*token)) {
+            *mode = value;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
 /*******************************************************************************
 *******************************************************************************/
 FILE * g_log_stream = NULL;
-aslclient gASLClientHandle = NULL;
-aslmsg    gASLMessage      = NULL;  // reused
+static boolean_t sNewLoggingOnly  = false;
+static os_log_t  sKextLog         = NULL;
+static os_log_t  sKextSignpostLog = NULL;
 // xxx - need to aslclose()
 
-void tool_openlog(const char * name)
+void tool_initlog()
 {
-    // xxx - do we want separate name & facility?
-    gASLClientHandle = asl_open(/* ident */ name, /* facility*/ name,
-        /* options */ 0);
-    gASLMessage     = asl_new(ASL_TYPE_MSG);
-    return;
+    uint32_t kextlog_mode = 0;
+    if (get_kextlog(&kextlog_mode)) {
+        os_log(OS_LOG_DEFAULT, "Setting kext log mode: 0x%x", kextlog_mode);
+        OSKextSetLogFilter(kextlog_mode, /* kernel? */ false);
+        OSKextSetLogFilter(kextlog_mode, /* kernel? */ true);
+    }
+
+    if (sKextLog == NULL) {
+        sKextLog = os_log_create("com.apple.kext", "kextlog");
+        sKextSignpostLog = os_log_create("com.apple.kext", "signposts");
+    }
+}
+
+void tool_openlog(const char * __unused name)
+{
+    sNewLoggingOnly = true;
+    tool_initlog();
+}
+
+os_log_t
+get_signpost_log(void)
+{
+    return sKextSignpostLog;
 }
 
 #if !TARGET_OS_EMBEDDED
@@ -1310,33 +1418,27 @@ void tool_log(
     OSKextLogSpec   msgLogSpec,
     const char    * format, ...)
 {
+    OSKextLogSpec kextLogLevel = msgLogSpec & kOSKextLogLevelMask;
+    os_log_type_t logType = OS_LOG_TYPE_DEFAULT;
     va_list ap;
 
-    if (gASLClientHandle) {
-        int            aslLevel = ASL_LEVEL_ERR;
-        OSKextLogSpec  kextLogLevel = msgLogSpec & kOSKextLogLevelMask;
-        char           messageLogSpec[16];
-
-        if (kextLogLevel == kOSKextLogErrorLevel) {
-            aslLevel = ASL_LEVEL_ERR;
-        } else if (kextLogLevel == kOSKextLogWarningLevel) {
-            aslLevel = ASL_LEVEL_WARNING;
-        } else if (kextLogLevel == kOSKextLogBasicLevel) {
-            aslLevel = ASL_LEVEL_NOTICE;
-        } else if (kextLogLevel < kOSKextLogDebugLevel) {
-            aslLevel = ASL_LEVEL_INFO;
-        } else {
-            aslLevel = ASL_LEVEL_DEBUG;
-        }
-        
-        snprintf(messageLogSpec, sizeof(messageLogSpec), "0x%x", msgLogSpec);
-        asl_set(gASLMessage, "OSKextLogSpec", messageLogSpec);
-
-        va_start(ap, format);
-        asl_vlog(gASLClientHandle, gASLMessage, aslLevel, format, ap);
-        va_end(ap);
-
+    if (kextLogLevel == kOSKextLogErrorLevel) {
+        logType = OS_LOG_TYPE_ERROR;
+    } else if (kextLogLevel == kOSKextLogWarningLevel) {
+        logType = OS_LOG_TYPE_DEFAULT;
+    } else if (kextLogLevel == kOSKextLogBasicLevel) {
+        logType = OS_LOG_TYPE_DEFAULT;
+    } else if (kextLogLevel < kOSKextLogDebugLevel) {
+        logType = OS_LOG_TYPE_INFO;
     } else {
+        logType = OS_LOG_TYPE_DEBUG;
+    }
+
+    va_start(ap, format);
+    os_log_with_args(sKextLog, logType, format, ap, __builtin_return_address(0));
+    va_end(ap);
+
+    if (!sNewLoggingOnly) {
         // xxx - change to pick log stream based on log level
         // xxx - (0 == stdout, all others stderr)
 
@@ -1443,7 +1545,11 @@ Boolean getKernelPathForURL(CFURLRef    theVolRootURL,
                 CFGetTypeID(postBootPathsDict) == CFDictionaryGetTypeID()) {
                 
                 kernelCacheDict = (CFDictionaryRef)
-                    CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
+                    CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV4Key);
+                if (!kernelCacheDict) {
+                    kernelCacheDict = (CFDictionaryRef)
+                        CFDictionaryGetValue(postBootPathsDict, kBCKernelcacheV3Key);
+                }
             }
         }
     } // theBuffer
@@ -1925,3 +2031,33 @@ finish:
     return result;
 }
 
+void
+setVariantSuffix(void)
+{
+    char* variant = 0;
+    size_t len = 0;
+    int result;
+    result = sysctlbyname("kern.osbuildconfig", NULL, &len, NULL, 0);
+    if (result == 0) {
+        variant = (char *)malloc(len + 2);
+        variant[0] = '_';
+        result = sysctlbyname("kern.osbuildconfig", &variant[1], &len, NULL, 0);
+        if (result == 0) {
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogDebugLevel,
+                "variant is %s",variant);
+            if (strcmp(&variant[1], "release") != 0) {
+               OSKextSetExecutableSuffix(variant, NULL);
+            }
+        } else {
+            OSKextLog(/* kext */ NULL,
+                kOSKextLogErrorLevel,
+                "kern.osbuildconfig failed after reporting return size of size %d",(int) len);
+        }
+        free(variant);
+    } else {
+        OSKextLog(/* kext */ NULL,
+            kOSKextLogErrorLevel,
+            "Impossible to query kern.osbuildconfig");
+    }
+}

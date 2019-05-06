@@ -14,6 +14,7 @@
 #include <mach/mach_error.h>
 
 #include <getopt.h>
+#include <os/log.h>
 #include <sysexits.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -78,7 +79,6 @@ typedef struct {
 #define RANGE_ALL(a)   CFRangeMake(0, CFArrayGetCount(a))
 
 #define COMPILE_TIME_ASSERT(pred)   switch(0){case 0:case pred:;}
-
 
 /*
  * Macros to support PATHCPY/PATHCAT
@@ -199,7 +199,9 @@ void beQuiet(void);
 
 FILE *  g_log_stream;
 // tool_openlog(), tool_log() copied to bootroot.h for libBootRoot clients
+void tool_initlog();
 void tool_openlog(const char * name);
+os_log_t get_signpost_log(void);
 void tool_log(
     OSKextRef aKext,
     OSKextLogSpec logSpec,
@@ -285,6 +287,16 @@ Boolean isSameFileDevAndInoWith_fd(int      the_fd,
                                    dev_t    the_dev_t,
                                    ino_t    the_ino_t);
 
+Boolean createRawBytesFromHexString(char *bytePtr,
+                                    size_t byteLen,
+                                    const char *hexPtr,
+                                    size_t hexLen);
+
+Boolean createHexStringFromRawBytes(char *hexPtr,
+                                    size_t hexLen,
+                                    const char *bytePtr,
+                                    size_t byteLen);
+
 // bootcaches.plist helpers
 CFDictionaryRef copyBootCachesDictForURL(CFURLRef theVolRootURL);
 Boolean getKernelPathForURL(
@@ -306,4 +318,5 @@ bool translatePrelinkedToImmutablePath(const char *prelinked_path,
 
 extern char * createUTF8CStringForCFString(CFStringRef aString);
 
+void setVariantSuffix(void);
 #endif /* _KEXT_TOOLS_UTIL_H */
